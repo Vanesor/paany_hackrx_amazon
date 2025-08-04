@@ -12,6 +12,7 @@ ENHANCED PRODUCTION-GRADE RAG SYSTEM (v9) - JINAAI OPTIMIZED FOR MAXIMUM SPEED
 # 1. IMPORTS & CONFIGURATION
 # ==============================================================================
 import os
+import ast
 import gc
 import asyncio
 import aiohttp
@@ -1194,7 +1195,7 @@ class JinaAIOptimizedRAGSystem:
         cached_result = await self.query_cache.get(query, context_hash)
         if cached_result:
             logger.info(f"[{request_id}] 🎯 Using cached query result")
-            return eval(cached_result)  # Safe since we control the cached content
+            return ast.literal_eval(cached_result)  # Safe since we control the cached content
         
         # Fast query embedding
         query_embedding = await self._embed_with_advanced_caching([query])

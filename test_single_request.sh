@@ -8,7 +8,7 @@ echo "📄 Document: Policy PDF"
 echo "❓ Questions: 10 policy-related questions"
 echo ""
 
-curl -X POST "http://localhost:8000/api/v1/hackrx/run" \
+curl -X POST "https://reverse-proxy-tj2t.onrender.com/api/v1/hackrx/run" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json" \
   -H "Authorization: Bearer 6e8b43cca9d29b261843a3b1c53382bdaa5b2c9e96db92da679278c6dc0042ca" \

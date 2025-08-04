@@ -52,11 +52,11 @@ ls -la
 
 # Set up environment file
 echo "🔐 Setting up environment configuration..."
-if [ ! -f .env ]; then
-    cp .env.example .env
-    echo "⚠️  IMPORTANT: Edit .env file and add your GOOGLE_API_KEY"
-    echo "   Run: nano .env"
-fi
+# if [ ! -f .env ]; then
+#     cp .env.example .env
+#     echo "⚠️  IMPORTANT: Edit .env file and add your GOOGLE_API_KEY"
+#     echo "   Run: nano .env"
+# fi
 
 # Create required directories
 echo "📂 Creating application directories..."
@@ -64,8 +64,8 @@ mkdir -p cache downloads auto_downloads
 
 # Build and start services
 echo "🏗️  Building and starting services..."
-sudo docker-compose build
-sudo docker-compose up -d
+# sudo docker-compose build
+sudo docker-compose up --build -d
 
 # Wait for services to be ready
 echo "⏳ Waiting for services to start..."
