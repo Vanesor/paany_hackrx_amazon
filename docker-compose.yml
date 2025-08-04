@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis.conf:/usr/local/etc/redis/redis.conf
+      - redis-data:/data
+    command: redis-server /usr/local/etc/redis/redis.conf
+    restart: unless-stopped
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  rag-system:
+    build: .
+    container_name: rag-system
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_EXPIRE_TIME=86400
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - CACHE_DIR=/app/cache
+      - NLTK_DATA=/app/nltk_data
+      - PYTHONPATH=/app
+    volumes:
+      - ./cache:/app/cache
+      - ./downloads:/app/downloads
+      - ./auto_downloads:/app/auto_downloads
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rag-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  redis-data:
+
+networks:
+  rag-network:
+    driver: bridge
