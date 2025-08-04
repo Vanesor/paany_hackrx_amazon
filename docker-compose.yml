@@ -44,6 +44,15 @@ services:
     networks:
       - rag-network
     restart: unless-stopped
+    # Resource limits for Lightsail 2GB optimization
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+          cpus: '1.8'
+        reservations:
+          memory: 1G
+          cpus: '1.0'
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s

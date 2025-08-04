@@ -62,12 +62,6 @@ fi
 echo "📂 Creating application directories..."
 mkdir -p cache downloads auto_downloads
 
-# Set proper permissions
-echo "🔒 Setting up permissions..."
-chmod +x setup.sh
-chmod +x start.sh
-chmod +x stop.sh
-
 # Build and start services
 echo "🏗️  Building and starting services..."
 sudo docker-compose build

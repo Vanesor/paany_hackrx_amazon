@@ -67,6 +67,10 @@ genai.configure(api_key=GOOGLE_API_KEY)
 CPU_COUNT = os.cpu_count() or 4
 global_executor = ThreadPoolExecutor(max_workers=min(CPU_COUNT * 2, 16))
 
+# Concurrency limiters for Lightsail 2GB RAM optimization
+REQUEST_SEMAPHORE = asyncio.Semaphore(3)  # Max 3 concurrent heavy requests
+PROCESSING_SEMAPHORE = asyncio.Semaphore(2)  # Max 2 concurrent document processing
+
 # Redis Configuration
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
@@ -1577,66 +1581,70 @@ async def process_document_and_answer(
     background_tasks: BackgroundTasks,
     authorization: str = Header(None)
 ):
-    """Main endpoint for document processing and question answering"""
+    """Main endpoint for document processing and question answering with concurrency control"""
     verify_token(authorization)
     request_id = f"req_{int(time.time() * 1000)}"
     start_time = time.time()
     
-    logger.info(f"[{request_id}] 🚀 New request | Questions: {len(request.questions)} | Model: JinaAI")
+    # Apply request-level concurrency limiting for Lightsail optimization
+    async with REQUEST_SEMAPHORE:
+        logger.info(f"[{request_id}] 🚀 New request | Questions: {len(request.questions)} | Model: JinaAI | Active: {3 - REQUEST_SEMAPHORE._value}")
 
-    try:
-        # PDF extraction with timing
-        pdf_start = time.time()
-        pages = await rag_system.download_and_extract(request.documents)
-        pdf_time = time.time() - pdf_start
-        logger.info(f"[{request_id}] 📄 PDF extracted: {len(pages)} pages in {pdf_time:.2f}s")
-        
-        # Document structure analysis
-        structure_start = time.time()
-        hierarchical_elements = rag_system.processor.extract_hierarchical_structure(pages, request_id)
-        structure_time = time.time() - structure_start
-        
-        # Convert to retrieval chunks
-        chunk_start = time.time()
-        chunks_with_metadata = rag_system.processor.get_chunks_for_retrieval(hierarchical_elements)
-        chunk_time = time.time() - chunk_start
-        
-        logger.info(f"[{request_id}] 📚 Created {len(chunks_with_metadata)} optimized chunks")
-        
-        # JinaAI embedding generation
-        embed_start = time.time()
-        chunk_texts = [c['text'] for c in chunks_with_metadata]
-        chunk_embeddings = await rag_system._embed_with_advanced_caching(chunk_texts)
-        embed_time = time.time() - embed_start
-        
-        logger.info(f"[{request_id}] ⚡ JinaAI embeddings completed in {embed_time:.2f}s")
+        try:
+            # Apply processing-level concurrency limiting for memory-intensive operations
+            async with PROCESSING_SEMAPHORE:
+                # PDF extraction with timing
+                pdf_start = time.time()
+                pages = await rag_system.download_and_extract(request.documents)
+                pdf_time = time.time() - pdf_start
+                logger.info(f"[{request_id}] 📄 PDF extracted: {len(pages)} pages in {pdf_time:.2f}s")
+                
+                # Document structure analysis
+                structure_start = time.time()
+                hierarchical_elements = rag_system.processor.extract_hierarchical_structure(pages, request_id)
+                structure_time = time.time() - structure_start
+                
+                # Convert to retrieval chunks
+                chunk_start = time.time()
+                chunks_with_metadata = rag_system.processor.get_chunks_for_retrieval(hierarchical_elements)
+                chunk_time = time.time() - chunk_start
+                
+                logger.info(f"[{request_id}] 📚 Created {len(chunks_with_metadata)} optimized chunks")
+                
+                # JinaAI embedding generation
+                embed_start = time.time()
+                chunk_texts = [c['text'] for c in chunks_with_metadata]
+                chunk_embeddings = await rag_system._embed_with_advanced_caching(chunk_texts)
+                embed_time = time.time() - embed_start
+                
+                logger.info(f"[{request_id}] ⚡ JinaAI embeddings completed in {embed_time:.2f}s")
 
-        # Process questions in parallel
-        async def process_single_question(question: str, q_idx: int) -> str:
-            q_request_id = f"{request_id}_q{q_idx+1}"
-            contexts = await rag_system.retrieve_and_rerank(
-                question, chunks_with_metadata, chunk_embeddings, q_request_id
-            )
-            return await rag_system.answer_question(question, contexts, q_request_id)
+            # Process questions in parallel (lighter operation, outside processing semaphore)
+            async def process_single_question(question: str, q_idx: int) -> str:
+                q_request_id = f"{request_id}_q{q_idx+1}"
+                contexts = await rag_system.retrieve_and_rerank(
+                    question, chunks_with_metadata, chunk_embeddings, q_request_id
+                )
+                return await rag_system.answer_question(question, contexts, q_request_id)
 
-        qa_start = time.time()
-        tasks = [process_single_question(q, i) for i, q in enumerate(request.questions)]
-        answers = await asyncio.gather(*tasks)
-        qa_time = time.time() - qa_start
+            qa_start = time.time()
+            tasks = [process_single_question(q, i) for i, q in enumerate(request.questions)]
+            answers = await asyncio.gather(*tasks)
+            qa_time = time.time() - qa_start
 
-        total_time = time.time() - start_time
+            total_time = time.time() - start_time
+            
+            logger.info(f"[{request_id}] ✅ Request completed in {total_time:.2f}s | JinaAI embedding: {embed_time:.2f}s")
+            
+            # Schedule background cleanup if needed
+            if background_tasks and total_time > 30:
+                background_tasks.add_task(cleanup_memory)
+            
+            return QueryResponse(answers=answers)
         
-        logger.info(f"[{request_id}] ✅ Request completed in {total_time:.2f}s | JinaAI embedding: {embed_time:.2f}s")
-        
-        # Schedule background cleanup if needed
-        if background_tasks and total_time > 30:
-            background_tasks.add_task(cleanup_memory)
-        
-        return QueryResponse(answers=answers)
-    
-    except Exception as e:
-        logger.error(f"[{request_id}] ❌ Error processing request: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        except Exception as e:
+            logger.error(f"[{request_id}] ❌ Error processing request: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 # --- Performance and Monitoring Endpoints ---
@@ -1711,6 +1719,34 @@ async def optimize_memory(authorization: str = Header(None)):
         "initial_memory_gb": round(initial_memory, 3),
         "final_memory_gb": round(final_memory, 3),
         "memory_freed_gb": round(memory_freed, 3)
+    }
+
+
+# --- Concurrency Monitoring Endpoint ---
+@app.get("/concurrency/status")
+async def get_concurrency_status(authorization: str = Header(None)):
+    """Get current concurrency status and queue information"""
+    verify_token(authorization)
+    
+    return {
+        "concurrency_limits": {
+            "max_concurrent_requests": 3,
+            "max_concurrent_processing": 2,
+            "current_active_requests": 3 - REQUEST_SEMAPHORE._value,
+            "current_processing_requests": 2 - PROCESSING_SEMAPHORE._value,
+            "requests_waiting": max(0, REQUEST_SEMAPHORE._waiters.__len__() if hasattr(REQUEST_SEMAPHORE, '_waiters') else 0),
+            "processing_waiting": max(0, PROCESSING_SEMAPHORE._waiters.__len__() if hasattr(PROCESSING_SEMAPHORE, '_waiters') else 0)
+        },
+        "resource_info": {
+            "cpu_cores": CPU_COUNT,
+            "device": DEVICE,
+            "thread_pool_size": global_executor._max_workers
+        },
+        "recommendations": {
+            "optimal_concurrent_requests": "3-5 for 2GB RAM",
+            "memory_per_request_estimate": "300-500MB",
+            "expected_queue_time": "10-30 seconds when busy"
+        }
     }
 
 
@@ -2146,7 +2182,7 @@ async def redis_status(authorization: str = Header(None)):
             "cache_stats": {
                 "embedding_cache": rag_system.embedding_cache.get_stats(),
                 "query_cache": rag_system.query_cache.get_stats()
-            }
+            }   
         }
 
 @app.get("/")
@@ -2177,11 +2213,20 @@ if __name__ == "__main__":
     logger.info(f"⚡ Model: {rag_system.embedding_model_name}")
     
     uvicorn.run(
-        "final_2:app", 
+        "main:app", 
         host="0.0.0.0", 
         port=8000, 
         reload=False,  # Disable reload for production
-        workers=1,     # Single worker for GPU efficiency
+        workers=1,     # Single worker for shared model state (OPTIMAL for ML)
         loop="asyncio",
-        log_level="info"
+        log_level="info",
+        # Optimize for limited resources (Lightsail 2GB)
+        timeout_keep_alive=30,
+        limit_concurrency=5,        # Limit concurrent requests to prevent OOM
+        limit_max_requests=200,     # Increased from 100 for better throughput
+        access_log=False,           # Reduce logging overhead
+        # Additional optimizations
+        h11_max_incomplete_event_size=16384,
+        ws_max_size=16777216,
+        lifespan="on"
     )
