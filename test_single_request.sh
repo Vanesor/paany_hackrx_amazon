@@ -3,12 +3,25 @@
 # Single Request Test - Policy Document
 # This tests a single request to your RAG system
 
+# echo "🚀 Testing single request to RAG system..."
+# echo "📄 Document: Policy PDF"
+# echo "❓ Questions: 10 policy-related questions"
+# echo "🌐 Using localhost server"
+# echo ""
+
+# curl -X POST "http://localhost:8000/api/v1/hackrx/run" \!/bin/bashcurl -X POST "http://localhost:8000/api/v1/hackrx/run" 
+#   -H "Content-Type: application/json" 
+#   -H "Accept: application/json" 
+#   -d '{Single Request Test - Policy Document
+# # This tests a single request to your RAG system
+
 echo "🚀 Testing single request to RAG system..."
 echo "📄 Document: Policy PDF"
 echo "❓ Questions: 10 policy-related questions"
+echo "🌐 Using localhost server"
 echo ""
 
-curl -X POST "https://reverse-proxy-tj2t.onrender.com/api/v1/hackrx/run" \
+curl -X POST "http://localhost:8000/api/v1/hackrx/run" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json" \
   -H "Authorization: Bearer 6e8b43cca9d29b261843a3b1c53382bdaa5b2c9e96db92da679278c6dc0042ca" \

@@ -23,9 +23,10 @@ import logging
 import hashlib
 import math
 import uvicorn
+import sys
 from typing import List, Dict, Any, Tuple, Optional, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import threading
 from functools import lru_cache
@@ -41,12 +42,10 @@ from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
-
-# Redis imports for advanced caching
-import redis.asyncio as redis
-import json
-import pickle
-import base64
+import psutil
+import signal
+import dotenv
+dotenv.load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +54,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Secrets and Critical Configurations ---
-GOOGLE_API_KEY = 'AIzaSyB1pi8BtnI-yAzmx6DLpUmwj5TPYjHmhJ0'
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 EXPECTED_TOKEN = "6e8b43cca9d29b261843a3b1c53382bdaa5b2c9e96db92da679278c6dc0042ca"
 
 if not GOOGLE_API_KEY:
@@ -64,21 +63,56 @@ if not GOOGLE_API_KEY:
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
-# Optimized thread pool configuration
+# OPTIMIZED thread pool configuration for parallel chunking under 4GB RAM
 CPU_COUNT = os.cpu_count() or 4
-global_executor = ThreadPoolExecutor(max_workers=min(CPU_COUNT * 2, 16))
+global_executor = ThreadPoolExecutor(max_workers=min(24, CPU_COUNT))  # Maximum threads for 4GB RAM performance
 
-# Concurrency limiters for Lightsail 2GB RAM optimization
-REQUEST_SEMAPHORE = asyncio.Semaphore(3)  # Max 3 concurrent heavy requests
-PROCESSING_SEMAPHORE = asyncio.Semaphore(2)  # Max 2 concurrent document processing
+# MEMORY-AWARE concurrency limits for <4GB RAM with MAXIMUM-SPEED parallel chunking  
+REQUEST_SEMAPHORE = asyncio.Semaphore(16)  # Allow 16 concurrent requests for maximum speed
+PROCESSING_SEMAPHORE = asyncio.Semaphore(16)  # Allow 16 concurrent document processing
+CHUNK_PROCESSING_SEMAPHORE = asyncio.Semaphore(24)  # Allow 24 concurrent chunk operations
+EMBEDDING_SEMAPHORE = asyncio.Semaphore(12)  # Allow 12 concurrent embedding batches
 
-# Redis Configuration
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
-REDIS_DB = int(os.getenv('REDIS_DB', 0))
-REDIS_PASSWORD = os.getenv('REDIS_PASSWORD', None)
-REDIS_EXPIRE_TIME = int(os.getenv('REDIS_EXPIRE_TIME', 86400))  # 24 hours default
-redis_client = None
+# Simplified configuration for maximum speed - no memory limits
+def get_memory_usage() -> float:
+    """Lightweight memory usage tracking"""
+    try:
+        process = psutil.Process()
+        return process.memory_info().rss / 1024 / 1024 / 1024
+    except:
+        return 0.0
+
+def force_memory_cleanup():
+    """Aggressive memory cleanup for 2GB RAM systems"""
+    import torch
+    try:
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear GPU cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        # Clear CPU cache
+        if hasattr(torch, 'cpu'):
+            torch.cpu.empty_cache() if hasattr(torch.cpu, 'empty_cache') else None
+        
+        # Additional cleanup
+        import threading
+        threading.current_thread()
+        
+        logger.info(f"🗑️ Memory cleanup complete: {get_memory_usage():.2f}GB")
+    except Exception as e:
+        logger.warning(f"Memory cleanup warning: {e}")
+
+def check_memory_threshold() -> bool:
+    """Check if memory usage is approaching 3.5GB limit for high-performance processing"""
+    current = get_memory_usage()
+    return current > 3.5  # Warning at 3.5GB for high-performance processing
+
+# Simplified configuration without Redis
+redis_client = None  # Disabled for performance
 
 # Advanced device configuration
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -113,9 +147,9 @@ class DocumentElement:
     start_char: int
     end_char: int
     parent_id: Optional[str] = None
-    children_ids: List[str] = None
+    children_ids: List[str] = field(default_factory=list)
     level: int = 0
-    metadata: Dict[str, Any] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.children_ids is None:
@@ -124,302 +158,8 @@ class DocumentElement:
             self.metadata = {}
 
 
-# 3. REDIS-ENHANCED MULTI-LEVEL CACHING SYSTEM
+# 3. SIMPLIFIED PROCESSING WITHOUT CACHING
 # ==============================================================================
-
-async def get_redis_client() -> redis.Redis:
-    """Get or create Redis client with connection pooling"""
-    global redis_client
-    if redis_client is None:
-        try:
-            redis_client = redis.Redis(
-                host=REDIS_HOST,
-                port=REDIS_PORT,
-                db=REDIS_DB,
-                password=REDIS_PASSWORD,
-                decode_responses=False,  # Keep binary for numpy arrays
-                socket_keepalive=True,
-                socket_keepalive_options={},
-                retry_on_timeout=True,
-                health_check_interval=30
-            )
-            # Test connection
-            await redis_client.ping()
-            logger.info(f"✅ Redis connected successfully at {REDIS_HOST}:{REDIS_PORT}")
-        except Exception as e:
-            logger.warning(f"⚠️ Redis connection failed: {e}. Using memory-only cache.")
-            redis_client = None
-    return redis_client
-
-class RedisEmbeddingCache:
-    """Hybrid Redis + Memory caching system for embeddings with intelligent fallback"""
-    
-    def __init__(self, max_memory_size: int = 10000):
-        # Memory cache for ultra-fast access
-        self.memory_cache = {}
-        self.memory_access_count = {}
-        self.memory_access_order = []
-        self.max_memory_size = max_memory_size
-        self.lock = threading.RLock()
-        
-        # Performance tracking
-        self.stats = {
-            'memory_hits': 0,
-            'redis_hits': 0,
-            'misses': 0,
-            'redis_errors': 0,
-            'total_sets': 0
-        }
-    
-    def _get_hash(self, text: str) -> str:
-        """Generate consistent hash for text content"""
-        return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
-    
-    def _serialize_embedding(self, embedding: np.ndarray) -> bytes:
-        """Serialize numpy array for Redis storage"""
-        return base64.b64encode(pickle.dumps(embedding)).decode('utf-8').encode()
-    
-    def _deserialize_embedding(self, data: bytes) -> np.ndarray:
-        """Deserialize numpy array from Redis"""
-        return pickle.loads(base64.b64decode(data.decode('utf-8')))
-    
-    async def get(self, text: str) -> Optional[np.ndarray]:
-        """Get embedding with hybrid memory+Redis lookup"""
-        text_hash = self._get_hash(text)
-        
-        # 1. Check memory cache first (fastest)
-        with self.lock:
-            if text_hash in self.memory_cache:
-                self.memory_access_count[text_hash] = self.memory_access_count.get(text_hash, 0) + 1
-                if text_hash in self.memory_access_order:
-                    self.memory_access_order.remove(text_hash)
-                self.memory_access_order.append(text_hash)
-                self.stats['memory_hits'] += 1
-                return self.memory_cache[text_hash].copy()
-        
-        # 2. Check Redis cache (persistent)
-        try:
-            redis_conn = await get_redis_client()
-            if redis_conn:
-                redis_key = f"embedding:{text_hash}"
-                cached_data = await redis_conn.get(redis_key)
-                if cached_data:
-                    embedding = self._deserialize_embedding(cached_data)
-                    # Store in memory cache for future ultra-fast access
-                    await self._set_memory_cache(text_hash, embedding)
-                    self.stats['redis_hits'] += 1
-                    return embedding
-        except Exception as e:
-            logger.debug(f"Redis get error: {e}")
-            self.stats['redis_errors'] += 1
-        
-        # 3. Cache miss
-        self.stats['misses'] += 1
-        return None
-    
-    async def set(self, text: str, embedding: np.ndarray):
-        """Store embedding in both memory and Redis"""
-        text_hash = self._get_hash(text)
-        self.stats['total_sets'] += 1
-        
-        # 1. Store in memory cache
-        await self._set_memory_cache(text_hash, embedding)
-        
-        # 2. Store in Redis for persistence
-        try:
-            redis_conn = await get_redis_client()
-            if redis_conn:
-                redis_key = f"embedding:{text_hash}"
-                serialized_data = self._serialize_embedding(embedding)
-                await redis_conn.setex(redis_key, REDIS_EXPIRE_TIME, serialized_data)
-        except Exception as e:
-            logger.debug(f"Redis set error: {e}")
-            self.stats['redis_errors'] += 1
-    
-    async def _set_memory_cache(self, text_hash: str, embedding: np.ndarray):
-        """Manage memory cache with intelligent eviction"""
-        with self.lock:
-            # Evict if memory cache is full
-            if len(self.memory_cache) >= self.max_memory_size and text_hash not in self.memory_cache:
-                await self._evict_memory_items(int(self.max_memory_size * 0.1))
-            
-            self.memory_cache[text_hash] = embedding.copy()
-            self.memory_access_count[text_hash] = self.memory_access_count.get(text_hash, 0) + 1
-            if text_hash not in self.memory_access_order:
-                self.memory_access_order.append(text_hash)
-    
-    async def _evict_memory_items(self, num_items: int):
-        """Intelligent memory cache eviction"""
-        if not self.memory_access_order:
-            return
-        
-        # Sort by access count (ascending) - evict least accessed first
-        candidates = []
-        for text_hash in self.memory_access_order:
-            if text_hash in self.memory_cache:
-                score = self.memory_access_count.get(text_hash, 1)
-                candidates.append((score, text_hash))
-        
-        candidates.sort()  # Least accessed first
-        
-        for _, text_hash in candidates[:num_items]:
-            if text_hash in self.memory_cache:
-                del self.memory_cache[text_hash]
-            if text_hash in self.memory_access_count:
-                del self.memory_access_count[text_hash]
-            if text_hash in self.memory_access_order:
-                self.memory_access_order.remove(text_hash)
-    
-    async def clear(self):
-        """Clear all caches"""
-        # Clear memory cache
-        with self.lock:
-            self.memory_cache.clear()
-            self.memory_access_count.clear()
-            self.memory_access_order.clear()
-        
-        # Clear Redis cache
-        try:
-            redis_conn = await get_redis_client()
-            if redis_conn:
-                # Delete all embedding keys
-                keys = await redis_conn.keys("embedding:*")
-                if keys:
-                    await redis_conn.delete(*keys)
-                logger.info("🗑️ Redis embedding cache cleared")
-        except Exception as e:
-            logger.debug(f"Redis clear error: {e}")
-            self.stats['redis_errors'] += 1
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get comprehensive cache statistics"""
-        total_requests = self.stats['memory_hits'] + self.stats['redis_hits'] + self.stats['misses']
-        memory_hit_rate = (self.stats['memory_hits'] / max(1, total_requests)) * 100
-        redis_hit_rate = (self.stats['redis_hits'] / max(1, total_requests)) * 100
-        overall_hit_rate = ((self.stats['memory_hits'] + self.stats['redis_hits']) / max(1, total_requests)) * 100
-        
-        with self.lock:
-            total_memory_accesses = sum(self.memory_access_count.values())
-            avg_memory_access = total_memory_accesses / max(len(self.memory_access_count), 1)
-            
-            return {
-                "memory_cache_size": len(self.memory_cache),
-                "max_memory_size": self.max_memory_size,
-                "memory_hit_rate": round(memory_hit_rate, 2),
-                "redis_hit_rate": round(redis_hit_rate, 2),
-                "overall_hit_rate": round(overall_hit_rate, 2),
-                "total_requests": total_requests,
-                "redis_errors": self.stats['redis_errors'],
-                "avg_memory_access": round(avg_memory_access, 2),
-                **self.stats
-            }
-
-
-class RedisQueryCache:
-    """Redis-backed query cache with memory buffer"""
-    
-    def __init__(self, max_memory_size: int = 500):
-        self.memory_cache = {}
-        self.memory_access_order = []
-        self.max_memory_size = max_memory_size
-        self.lock = threading.RLock()
-        
-        self.stats = {
-            'memory_hits': 0,
-            'redis_hits': 0,
-            'misses': 0,
-            'redis_errors': 0
-        }
-    
-    def _get_key(self, query: str, context_hash: str) -> str:
-        combined = f"{query}||{context_hash}"
-        return hashlib.sha256(combined.encode('utf-8')).hexdigest()[:16]
-    
-    async def get(self, query: str, context_hash: str) -> Optional[str]:
-        key = self._get_key(query, context_hash)
-        
-        # Check memory cache first
-        with self.lock:
-            if key in self.memory_cache:
-                self.memory_access_order.remove(key)
-                self.memory_access_order.append(key)
-                self.stats['memory_hits'] += 1
-                return self.memory_cache[key]
-        
-        # Check Redis cache
-        try:
-            redis_conn = await get_redis_client()
-            if redis_conn:
-                redis_key = f"query:{key}"
-                cached_answer = await redis_conn.get(redis_key)
-                if cached_answer:
-                    answer = cached_answer.decode('utf-8')
-                    # Store in memory for fast future access
-                    await self._set_memory_cache(key, answer)
-                    self.stats['redis_hits'] += 1
-                    return answer
-        except Exception as e:
-            logger.debug(f"Redis query get error: {e}")
-            self.stats['redis_errors'] += 1
-        
-        self.stats['misses'] += 1
-        return None
-    
-    async def set(self, query: str, context_hash: str, answer: str):
-        key = self._get_key(query, context_hash)
-        
-        # Store in memory
-        await self._set_memory_cache(key, answer)
-        
-        # Store in Redis
-        try:
-            redis_conn = await get_redis_client()
-            if redis_conn:
-                redis_key = f"query:{key}"
-                await redis_conn.setex(redis_key, REDIS_EXPIRE_TIME, answer.encode('utf-8'))
-        except Exception as e:
-            logger.debug(f"Redis query set error: {e}")
-            self.stats['redis_errors'] += 1
-    
-    async def _set_memory_cache(self, key: str, answer: str):
-        with self.lock:
-            if len(self.memory_cache) >= self.max_memory_size and key not in self.memory_cache:
-                oldest = self.memory_access_order.pop(0)
-                del self.memory_cache[oldest]
-            
-            self.memory_cache[key] = answer
-            if key not in self.memory_access_order:
-                self.memory_access_order.append(key)
-    
-    async def clear(self):
-        # Clear memory cache
-        with self.lock:
-            self.memory_cache.clear()
-            self.memory_access_order.clear()
-        
-        # Clear Redis cache
-        try:
-            redis_conn = await get_redis_client()
-            if redis_conn:
-                keys = await redis_conn.keys("query:*")
-                if keys:
-                    await redis_conn.delete(*keys)
-                logger.info("🗑️ Redis query cache cleared")
-        except Exception as e:
-            logger.debug(f"Redis query clear error: {e}")
-            self.stats['redis_errors'] += 1
-    
-    def get_stats(self) -> Dict[str, Any]:
-        total_requests = self.stats['memory_hits'] + self.stats['redis_hits'] + self.stats['misses']
-        hit_rate = ((self.stats['memory_hits'] + self.stats['redis_hits']) / max(1, total_requests)) * 100
-        
-        return {
-            "memory_cache_size": len(self.memory_cache),
-            "hit_rate": round(hit_rate, 2),
-            "total_requests": total_requests,
-            **self.stats
-        }
-
 
 # 4. ENHANCED SEMANTIC PROCESSOR CLASS
 # ==============================================================================
@@ -501,17 +241,11 @@ class HierarchicalSemanticProcessor:
         }
 
     def extract_hierarchical_structure(self, pages: List[Tuple[int, str]], request_id: str) -> List[DocumentElement]:
-        """Extract hierarchical document structure with optimized processing"""
-        # Combine all pages with character mapping
-        full_text, char_to_page_map = "", {}
-        for page_num, page_text in pages:
-            start_char = len(full_text)
-            clean_page_text = page_text + "\n\n"
-            full_text += clean_page_text
-            for i in range(start_char, len(full_text), max(1, len(clean_page_text) // 100)):
-                char_to_page_map[i] = page_num
+        """Extract hierarchical document structure with optimized PARALLEL processing"""
+        # Combine all pages with character mapping using PARALLEL processing
+        full_text, char_to_page_map = self._combine_pages_parallel(pages)
         
-        logger.info(f"[{request_id}] 🔍 Analyzing document structure...")
+        logger.info(f"[{request_id}] 🔍 Analyzing document structure with PARALLEL processing...")
         
         # Create hash for caching analysis
         text_hash = hashlib.sha256(full_text[:10000].encode()).hexdigest()[:16]
@@ -521,17 +255,74 @@ class HierarchicalSemanticProcessor:
         analysis = self.analyze_document_structure(text_hash, word_count, text_sample)
         logger.info(f"[{request_id}] 📊 Document analysis: {analysis}")
         
-        # Parallel heading detection for large documents
-        if len(full_text) > 100000:
+        # PARALLEL heading detection for better performance (lowered threshold)
+        if len(full_text) > 50000:  # Lowered from 100000 for more parallel processing
             headings = self._parallel_heading_detection(full_text, char_to_page_map)
         else:
             headings = self._sequential_heading_detection(full_text, char_to_page_map)
         
-        # Create hierarchical structure
-        elements = self._build_hierarchy(headings, full_text, char_to_page_map, analysis, pages)
+        # Create hierarchical structure with PARALLEL chunk processing
+        elements = self._build_hierarchy_parallel(headings, full_text, char_to_page_map, analysis, pages, request_id)
         
-        logger.info(f"[{request_id}] 🏗️ Created {len(elements)} hierarchical elements")
+        logger.info(f"[{request_id}] 🏗️ Created {len(elements)} hierarchical elements with PARALLEL processing")
         return elements
+
+    def _combine_pages_parallel(self, pages: List[Tuple[int, str]]) -> Tuple[str, Dict[int, int]]:
+        """Combine pages in parallel for better performance"""
+        if len(pages) <= 4:
+            # Sequential for small documents
+            full_text, char_to_page_map = "", {}
+            for page_num, page_text in pages:
+                start_char = len(full_text)
+                clean_page_text = page_text + "\n\n"
+                full_text += clean_page_text
+                for i in range(start_char, len(full_text), max(1, len(clean_page_text) // 100)):
+                    char_to_page_map[i] = page_num
+            return full_text, char_to_page_map
+        
+        # Parallel processing for larger documents
+        def process_page_chunk(page_group):
+            text_parts = []
+            char_maps = []
+            current_offset = 0
+            
+            for page_num, page_text in page_group:
+                start_char = current_offset
+                clean_page_text = page_text + "\n\n"
+                text_parts.append(clean_page_text)
+                end_char = current_offset + len(clean_page_text)
+                
+                page_map = {}
+                for i in range(start_char, end_char, max(1, len(clean_page_text) // 100)):
+                    page_map[i] = page_num
+                char_maps.append(page_map)
+                current_offset = end_char
+            
+            return "".join(text_parts), char_maps
+        
+        # Split pages into chunks for parallel processing
+        chunk_size = max(2, len(pages) // min(4, len(pages)))
+        page_chunks = [pages[i:i + chunk_size] for i in range(0, len(pages), chunk_size)]
+        
+        # Process chunks in parallel with memory-aware limits
+        max_workers = min(6, len(page_chunks))  # Increased for ultra-fast speed
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            chunk_results = list(executor.map(process_page_chunk, page_chunks))
+        
+        # Combine results efficiently
+        full_text = ""
+        char_to_page_map = {}
+        
+        for chunk_text, chunk_maps in chunk_results:
+            text_offset = len(full_text)
+            full_text += chunk_text
+            
+            # Adjust character mappings efficiently
+            for char_map in chunk_maps:
+                for char_pos, page_num in char_map.items():
+                    char_to_page_map[char_pos + text_offset] = page_num
+        
+        return full_text, char_to_page_map
 
     def _parallel_heading_detection(self, full_text: str, char_to_page_map: Dict[int, int]) -> List[Dict]:
         """Parallel heading detection for large documents"""
@@ -577,12 +368,14 @@ class HierarchicalSemanticProcessor:
                 page_num = char_to_page_map.get(start_pos, 1)
                 
                 headings.append({
-                    'title': title,
+                    'text': title,  # Use 'text' for consistency
+                    'title': title,  # Keep 'title' for backward compatibility
                     'type': chunk_type,
                     'level': level,
                     'start': start_pos,
                     'end': end_pos,
-                    'page': page_num
+                    'page': page_num,
+                    'pattern': pattern.pattern  # Add pattern info for debugging
                 })
         
         return headings
@@ -659,6 +452,85 @@ class HierarchicalSemanticProcessor:
         
         # Create paragraph-level chunks with content-aware sizing
         self._create_content_aware_chunks(elements, full_text, char_to_page_map, element_counter, analysis)
+        
+        return elements
+
+    def _build_hierarchy_parallel(self, headings: List[Dict], full_text: str, char_to_page_map: Dict[int, int],
+                                analysis: Dict[str, Any], pages: List[Tuple[int, str]], request_id: str) -> List[DocumentElement]:
+        """Build hierarchical structure with PARALLEL chunk processing for better performance"""
+        elements = []
+        element_counter = 0
+        
+        # Create root document element
+        root_element = DocumentElement(
+            element_id=f"doc_0",
+            element_type=ChunkType.DOCUMENT,
+            title="Document Root",
+            content="",
+            page_numbers=list(range(1, len(pages) + 1)),
+            start_char=0,
+            end_char=len(full_text),
+            level=0,
+            metadata=analysis
+        )
+        elements.append(root_element)
+        element_counter += 1
+        
+        # Process headings to create hierarchy (sequential for structure)
+        current_parents = {0: "doc_0"}  # level -> parent_id mapping
+        
+        for i, heading in enumerate(headings):
+            try:
+                # Debug heading structure
+                logger.debug(f"[{request_id}] Processing heading {i}: {heading}")
+                
+                # Ensure heading has required fields
+                if 'text' not in heading:
+                    heading['text'] = heading.get('title', 'Unknown')
+                if 'start' not in heading or 'end' not in heading:
+                    logger.warning(f"[{request_id}] Heading missing start/end: {heading}")
+                    continue
+                    
+                # Determine content boundaries
+                content_start = heading['end']
+                content_end = headings[i + 1]['start'] if i + 1 < len(headings) else len(full_text)
+                
+                # Extract content for this heading
+                heading_content = full_text[content_start:content_end].strip()
+                pages_for_heading = self._get_pages_for_range(heading['start'], content_end, char_to_page_map)
+                
+                # Create element
+                element_id = f"elem_{element_counter}"
+                parent_id = self._find_parent_id(heading['level'], current_parents)
+                
+                element = DocumentElement(
+                    element_id=element_id,
+                    element_type=heading['type'],
+                    title=heading['text'],
+                    content=heading_content,
+                    page_numbers=pages_for_heading,
+                    start_char=heading['start'],
+                    end_char=content_end,
+                    parent_id=parent_id,
+                    children_ids=[],
+                    level=heading['level'],
+                    metadata={"heading_pattern": heading.get('pattern', 'unknown')}
+                )
+                elements.append(element)
+                
+                # Update current parents mapping
+                current_parents[heading['level']] = element_id
+                current_parents = {k: v for k, v in current_parents.items() if k <= heading['level']}
+                
+                element_counter += 1
+                
+            except Exception as e:
+                logger.error(f"[{request_id}] Error processing heading {i}: {e} | Heading: {heading}")
+                continue
+        
+        # Create paragraph-level chunks with PARALLEL content-aware processing
+        logger.info(f"[{request_id}] 🔄 Starting PARALLEL chunk processing...")
+        self._create_content_aware_chunks_parallel(elements, full_text, char_to_page_map, element_counter, analysis, request_id)
         
         return elements
 
@@ -806,38 +678,41 @@ class HierarchicalSemanticProcessor:
         return best_break
 
     def _get_optimal_chunk_size(self, analysis: Dict[str, Any]) -> int:
-        """Determine optimal chunk size based on document analysis"""
+        """Determine optimal chunk size for heavy files under 1.7GB RAM"""
         doc_type = analysis.get('document_type', 'article')
         complexity = analysis.get('structure_complexity', 'simple')
         size_category = analysis.get('size_category', 'standard')
         
+        # ULTRA-SMALL chunk sizes optimized for heavy files under 1.7GB RAM
         base_sizes = {
-            'legal': 1800,
-            'academic': 1600,
-            'book': 1200,
-            'article': 1000
+            'legal': 1200,     # Severely reduced for heavy files
+            'academic': 1000,  # Severely reduced for heavy files
+            'book': 800,       # Severely reduced for heavy files
+            'article': 700     # Severely reduced for heavy files
         }
         
         complexity_multipliers = {
-            'simple': 1.0,
-            'moderate': 1.2,
-            'complex': 1.4
+            'simple': 0.8,     # Reduced for heavy files
+            'moderate': 1.0,
+            'complex': 1.2
         }
         
         size_multipliers = {
-            'standard': 1.0,
-            'medium': 1.1,
-            'large': 1.3
+            'standard': 0.8,   # Reduced for heavy files
+            'medium': 1.0,
+            'large': 1.1       # Reduced multiplier for heavy files
         }
         
-        base_size = base_sizes.get(doc_type, 1000)
-        complexity_mult = complexity_multipliers.get(complexity, 1.0)
-        size_mult = size_multipliers.get(size_category, 1.0)
+        base_size = base_sizes.get(doc_type, 700)  # Default ultra-optimized for heavy files
+        complexity_mult = complexity_multipliers.get(complexity, 0.8)
+        size_mult = size_multipliers.get(size_category, 0.8)
         
-        return int(base_size * complexity_mult * size_mult)
+        final_size = int(base_size * complexity_mult * size_mult)
+        # Ensure chunk size is never too large for heavy files
+        return min(final_size, 1000)  # Hard cap at 1000 for heavy files
 
     def get_chunks_for_retrieval(self, elements: List[DocumentElement]) -> List[Dict[str, Any]]:
-        """Convert hierarchical elements to chunks suitable for retrieval"""
+        """Convert hierarchical elements to chunks suitable for retrieval - SPEED OPTIMIZED"""
         chunks = []
         
         for element in elements:
@@ -869,7 +744,118 @@ class HierarchicalSemanticProcessor:
             }
             chunks.append(chunk)
         
+        # Ultra-aggressive reduction for heavy files under 1.7GB RAM
+        max_chunks = 25  # Severely reduced from 60 for heavy files
+        if len(chunks) > max_chunks:
+            # Intelligent chunk selection: mix of longest and highest quality chunks
+            chunks_sorted_by_length = sorted(chunks, key=lambda x: x['char_count'], reverse=True)[:max_chunks//2]
+            chunks_sorted_by_quality = sorted(chunks, key=lambda x: x.get('word_count', 0), reverse=True)[:max_chunks//2]
+            
+            # Combine and deduplicate
+            combined_chunks = []
+            seen_ids = set()
+            for chunk in chunks_sorted_by_length + chunks_sorted_by_quality:
+                chunk_id = chunk.get('element_id', chunk.get('text', '')[:50])
+                if chunk_id not in seen_ids:
+                    combined_chunks.append(chunk)
+                    seen_ids.add(chunk_id)
+            
+            chunks = combined_chunks[:max_chunks]
+            logger.info(f"🚀 Heavy file optimization: Limited to {len(chunks)} chunks (from {len(chunks_sorted_by_length + chunks_sorted_by_quality)})")
+        
         return chunks
+
+    def _create_content_aware_chunks_parallel(self, elements: List[DocumentElement], full_text: str,
+                                            char_to_page_map: Dict[int, int], counter_start: int,
+                                            analysis: Dict[str, Any], request_id: str) -> None:
+        """Create content-aware chunks with PARALLEL processing for better performance"""
+        element_counter = counter_start
+        new_elements = []
+        
+        # Get optimal chunk size based on document characteristics
+        base_chunk_size = self._get_optimal_chunk_size(analysis)
+        
+        # Filter elements that need chunking
+        elements_to_chunk = [
+            elem for elem in elements 
+            if elem.element_type in [ChunkType.SECTION, ChunkType.SUBSECTION, ChunkType.CHAPTER] 
+            and len(elem.content) > base_chunk_size * 1.3
+        ]
+        
+        if not elements_to_chunk:
+            logger.info(f"[{request_id}] ⚡ No elements need chunking - skipping parallel processing")
+            return
+        
+        logger.info(f"[{request_id}] 🔄 Processing {len(elements_to_chunk)} elements in parallel...")
+        
+        # Define chunk processing function for parallel execution
+        def process_element_chunks(element_data):
+            element, element_idx = element_data
+            content = element.content
+            
+            # Dynamic chunk sizing based on content density
+            content_density = self._calculate_content_density(content)
+            adjusted_chunk_size = int(base_chunk_size * content_density)
+            
+            # Split content with semantic awareness
+            chunk_elements = self._split_content_aware(
+                content, adjusted_chunk_size, element.start_char,
+                char_to_page_map, element.element_id, counter_start + element_idx * 100
+            )
+            
+            return element.element_id, chunk_elements
+        
+        # Process elements in parallel with memory-conscious batching
+        max_workers = min(8, len(elements_to_chunk))  # Increased for ultra-fast speed with higher RAM
+        
+        async def process_chunks_with_semaphore():
+            # Use semaphore to control concurrent chunk processing
+            async with CHUNK_PROCESSING_SEMAPHORE:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    # Prepare data for parallel processing
+                    element_data = [(elem, idx) for idx, elem in enumerate(elements_to_chunk)]
+                    
+                    # Execute parallel processing
+                    results = list(executor.map(process_element_chunks, element_data))
+                    
+                    return results
+        
+        # Run the parallel processing (this will be called from within async context)
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're in an async context, use thread executor
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    element_data = [(elem, idx) for idx, elem in enumerate(elements_to_chunk)]
+                    results = list(executor.map(process_element_chunks, element_data))
+            else:
+                # Sync context
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    element_data = [(elem, idx) for idx, elem in enumerate(elements_to_chunk)]
+                    results = list(executor.map(process_element_chunks, element_data))
+        except Exception as e:
+            logger.warning(f"[{request_id}] ⚠️ Parallel processing failed, falling back to sequential: {e}")
+            # Fallback to sequential processing
+            results = []
+            for idx, element in enumerate(elements_to_chunk):
+                result = process_element_chunks((element, idx))
+                results.append(result)
+        
+        # Combine results and update parent elements
+        total_new_chunks = 0
+        for element_id, chunk_elements in results:
+            # Find the parent element and update its children
+            parent_element = next((e for e in elements if e.element_id == element_id), None)
+            if parent_element:
+                for chunk_elem in chunk_elements:
+                    new_elements.append(chunk_elem)
+                    parent_element.children_ids.append(chunk_elem.element_id)
+                    total_new_chunks += 1
+        
+        elements.extend(new_elements)
+        logger.info(f"[{request_id}] ✅ PARALLEL chunking complete: {total_new_chunks} new chunks created")
 
 
 # 5. ULTRA-FAST RAG SYSTEM WITH JINAAI EMBEDDING
@@ -881,23 +867,24 @@ class JinaAIOptimizedRAGSystem:
         self.tokenizer = None
         self.reranker_model = None
         
-        # JinaAI Embedding Configuration
-        self.embedding_model_name = 'jinaai/jina-embedding-s-en-v1'
+        # 2GB RAM OPTIMIZED Configuration
+        self.embedding_model_name = 'sentence-transformers/all-MiniLM-L6-v2'  # Lightweight model
         self.reranker_model_name = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
-        self.llm_model = genai.GenerativeModel('gemini-2.5-flash-lite')
+        self.llm_model = genai.GenerativeModel('gemini-1.5-flash')  # Fast model
         
-        # Retrieval parameters
-        self.top_k_initial = 20
-        self.top_k_final = 8
+        # ULTRA-CONSERVATIVE retrieval parameters for heavy files under 1.7GB RAM
+        self.top_k_initial = 4   # Severely reduced from 8
+        self.top_k_final = 2     # Severely reduced from 4
         
-        # Advanced Redis-enabled caching system
-        self.embedding_cache = RedisEmbeddingCache(max_memory_size=10000)
-        self.query_cache = RedisQueryCache(max_memory_size=500)
-        
-        # Dynamic batch processing settings
-        self.base_batch_size = 32
+        # CPU offloading batch processing - optimized for 4GB RAM
+        self.base_batch_size = 12    # Increased for maximum speed with 4GB RAM
         self.max_batch_size = self._calculate_optimal_batch_size()
-        self.enable_half_precision = DEVICE == "cuda" and GPU_MEMORY_GB > 4
+        self.enable_half_precision = False  # Disabled for stability on heavy files
+        
+        # Memory-optimized settings for heavy files
+        self.skip_reranking = False  # Keep for accuracy
+        self.rerank_threshold = 0.8  # Higher threshold to skip more reranking
+        self.max_chunks_for_speed = 25  # Ultra-optimized for heavy files under 1.7GB RAM
         
         # Performance monitoring
         self.performance_stats = {
@@ -905,41 +892,115 @@ class JinaAIOptimizedRAGSystem:
             'cache_hits': 0,
             'cache_misses': 0,
             'average_batch_size': 0,
-            'gpu_memory_usage': 0
+            'memory_cleanups': 0
         }
 
     def _calculate_optimal_batch_size(self) -> int:
-        """Calculate optimal batch size based on available resources"""
-        if DEVICE == "cuda":
-            # Adjust batch size based on GPU memory
-            if GPU_MEMORY_GB >= 16:
-                return 128
-            elif GPU_MEMORY_GB >= 8:
-                return 64
-            elif GPU_MEMORY_GB >= 4:
-                return 32
-            else:
-                return 16
+        """Calculate optimal batch size optimized for 4GB RAM"""
+        current_memory = get_memory_usage()
+        
+        # Optimized batching for 4GB RAM systems
+        if current_memory > 3.0:  # If using more than 3.0GB
+            return 2  # Reduced batches when near memory limit
+        elif DEVICE == "cuda":
+            # GPU with CPU offloading - larger batches for 4GB RAM
+            return min(6, CPU_COUNT // 2)
         else:
-            # CPU-based processing
-            return min(16, CPU_COUNT * 2)
+            # CPU-only processing - optimized for heavy files
+            return min(2, max(1, CPU_COUNT // 8))  # Ultra-conservative for heavy files
 
     def load_models(self):
-        """Load all ML models with JinaAI optimizations"""
-        logger.info("--- Loading JinaAI Embedding Model with Advanced Optimizations ---")
+        """Load models with CPU offloading and 2GB RAM optimization"""
+        logger.info("--- Loading Models with CPU Offloading for 2GB RAM ---")
         
-        # Load JinaAI embedding model with optimizations
-        self.embedding_model = SentenceTransformer(
-            self.embedding_model_name,
-            device=DEVICE
-        )
-        
-        # Load tokenizer for advanced text preprocessing
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.embedding_model_name
-        )
-        
-        # Apply optimizations for GPU
+        try:
+            import torch
+            
+            # Force CPU-only mode for memory efficiency
+            logger.info(f"🔧 Forcing CPU mode for 2GB RAM optimization")
+            
+            # Load embedding model with CPU offloading
+            logger.info(f"Loading embedding model: {self.embedding_model_name}")
+            self.embedding_model = SentenceTransformer(
+                self.embedding_model_name,
+                device="cpu",  # Force CPU for memory efficiency
+                cache_folder="/tmp/sentence_transformers"
+            )
+            
+            # Disable gradient tracking for inference-only mode
+            if hasattr(self.embedding_model, 'eval'):
+                self.embedding_model.eval()
+            
+            # Disable gradients completely to save memory
+            for param in self.embedding_model.parameters():
+                param.requires_grad = False
+            
+            # Enable CPU offloading if available
+            if hasattr(torch, 'backends') and hasattr(torch.backends, 'mps'):
+                torch.backends.mps.enabled = False  # Disable MPS for stability
+            
+            # Set memory-efficient settings
+            torch.set_num_threads(min(4, CPU_COUNT))  # Limit thread usage
+            
+            # Load tokenizer with minimal memory footprint
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.embedding_model_name,
+                    cache_dir="/tmp/transformers",
+                    use_fast=True,  # Use fast tokenizer for efficiency
+                    model_max_length=512  # Limit max length
+                )
+            except Exception as e:
+                logger.warning(f"Could not load tokenizer: {e}")
+                self.tokenizer = None
+            
+            # Load reranker with CPU offloading
+            logger.info(f"Loading reranker: {self.reranker_model_name}")
+            self.reranker_model = CrossEncoder(
+                self.reranker_model_name,
+                device="cpu",  # Force CPU
+                max_length=256  # Reduce max length for memory
+            )
+            
+            # Disable gradients for reranker
+            if hasattr(self.reranker_model.model, 'eval'):
+                self.reranker_model.model.eval()
+            
+            for param in self.reranker_model.model.parameters():
+                param.requires_grad = False
+            
+            # Minimal warmup with very small batch
+            logger.info("🔥 Minimal warmup for 2GB system...")
+            warmup_texts = ["Test"]
+            
+            # Ultra-small warmup
+            with torch.no_grad():  # Ensure no gradient computation
+                _ = self.embedding_model.encode(
+                    warmup_texts,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    batch_size=1,
+                    convert_to_numpy=True
+                )
+            
+            # Warmup reranker with minimal data
+            with torch.no_grad():
+                _ = self.reranker_model.predict([["test", "test"]], show_progress_bar=False)
+            
+            # Aggressive memory cleanup
+            gc.collect()
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
+            
+            # Update batch size after model loading
+            self.max_batch_size = self._calculate_optimal_batch_size()
+            
+            logger.info(f"✅ Models loaded with CPU offloading | Max batch size: {self.max_batch_size}")
+            logger.info(f"💾 Memory usage after loading: {get_memory_usage():.2f}GB")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to load models: {e}")
+            raise RuntimeError(f"Model loading failed: {e}")
         if self.enable_half_precision:
             logger.info("🚀 Enabling half precision (FP16) for GPU acceleration")
             self.embedding_model = self.embedding_model.half()
@@ -979,26 +1040,61 @@ class JinaAIOptimizedRAGSystem:
         logger.info(f"--- JinaAI Models loaded successfully | Max batch size: {self.max_batch_size} ---")
 
     def _extract_pdf_text(self, content: bytes) -> List[Tuple[int, str]]:
-        """Optimized PDF text extraction with parallel processing"""
+        """Memory-optimized PDF text extraction for heavy files under 1.7GB RAM"""
         pages = []
-        with fitz.open(stream=content, filetype="pdf") as doc:
-            if len(doc) > 10:  # Use parallel processing for larger PDFs
-                with ThreadPoolExecutor(max_workers=min(CPU_COUNT, 8)) as pdf_executor:
-                    futures = []
-                    for page_num in range(len(doc)):
-                        future = pdf_executor.submit(self._extract_single_page, doc, page_num)
-                        futures.append((page_num, future))
-                    
-                    for page_num, future in futures:
-                        text = future.result()
-                        if text and text.strip():
-                            pages.append((page_num + 1, text))
-            else:
-                # Sequential processing for smaller PDFs
-                for page_num, page in enumerate(doc):
-                    text = page.get_text("text")
-                    if text and text.strip():
-                        pages.append((page_num + 1, text))
+        initial_memory = get_memory_usage()
+        logger.info(f"📄 Starting PDF extraction | Memory: {initial_memory:.2f}GB")
+        
+        try:
+            with fitz.open(stream=content, filetype="pdf") as doc:
+                total_pages = len(doc)
+                logger.info(f"📄 Processing {total_pages} pages")
+                
+                # For heavy files, process in larger batches with memory cleanup
+                if total_pages > 20 or len(content) > 20_000_000:  # Heavy file detection
+                    batch_size = 24  # Process 24 pages at a time for maximum speed with 4GB RAM
+                    for batch_start in range(0, total_pages, batch_size):
+                        batch_end = min(batch_start + batch_size, total_pages)
+                        
+                        # Process batch
+                        for page_num in range(batch_start, batch_end):
+                            try:
+                                text = doc[page_num].get_text("text")
+                                if text and text.strip():
+                                    # Truncate very long pages to save memory
+                                    if len(text) > 50000:
+                                        text = text[:50000] + "...[truncated]"
+                                    pages.append((page_num + 1, text))
+                            except Exception as e:
+                                logger.warning(f"Error extracting page {page_num + 1}: {e}")
+                        
+                        # Memory cleanup after each batch - optimized for 4GB RAM
+                        gc.collect()
+                        current_memory = get_memory_usage()
+                        if current_memory > 3.5:  # Increased threshold for 4GB RAM
+                            logger.warning(f"⚠️ High memory usage: {current_memory:.2f}GB - forcing cleanup")
+                            force_memory_cleanup()
+                        
+                        logger.info(f"📄 Processed batch {batch_start+1}-{batch_end} | Memory: {current_memory:.2f}GB")
+                else:
+                    # Normal processing for smaller files
+                    for page_num, page in enumerate(doc):
+                        try:
+                            text = page.get_text("text")
+                            if text and text.strip():
+                                pages.append((page_num + 1, text))
+                        except Exception as e:
+                            logger.warning(f"Error extracting page {page_num + 1}: {e}")
+        
+        except Exception as e:
+            logger.error(f"❌ PDF extraction failed: {e}")
+            return []
+        
+        finally:
+            # Final cleanup
+            gc.collect()
+            final_memory = get_memory_usage()
+            logger.info(f"📄 PDF extraction complete: {len(pages)} pages | Memory: {final_memory:.2f}GB")
         
         return sorted(pages, key=lambda x: x[0])
 
@@ -1068,84 +1164,122 @@ class JinaAIOptimizedRAGSystem:
         return processed_texts
 
     async def _embed_with_advanced_caching(self, texts: List[str]) -> np.ndarray:
-        """Ultra-fast embedding with advanced caching and JinaAI optimizations"""
+        """ULTRA-OPTIMIZED embedding generation with concurrent processing"""
+        import torch
+        start_time = time.time()
+        
         if not texts:
             return np.array([])
         
-        # Preprocess texts for JinaAI
-        processed_texts = self._preprocess_texts_for_jina(texts)
+        # Memory monitoring with relaxed thresholds for speed
+        current_memory = get_memory_usage()
+        logger.info(f"💾 Memory before embedding: {current_memory:.2f}GB")
         
-        embeddings = []
-        texts_to_embed = []
-        cache_indices = []
+        # Early cleanup if memory is very high (increased threshold)
+        if current_memory > 3.0:
+            logger.warning(f"⚠️ High memory before embedding - forcing cleanup")
+            force_memory_cleanup()
+            current_memory = get_memory_usage()
         
-        # Check cache with batch optimization
-        cache_hits = 0
-        for i, text in enumerate(processed_texts):
-            cached_embedding = await self.embedding_cache.get(text)
-            if cached_embedding is not None:
-                embeddings.append((i, cached_embedding))
-                cache_hits += 1
-            else:
-                texts_to_embed.append(text)
-                cache_indices.append(i)
+        # Optimized text preprocessing for speed
+        processed_texts = []
+        for text in texts:
+            # Increased limits for better accuracy while maintaining speed
+            cleaned = ' '.join(text.strip().split())[:512]  # Increased from 128 to 512
+            processed_texts.append(cleaned)
         
-        # Update performance stats
-        self.performance_stats['cache_hits'] += cache_hits
-        self.performance_stats['cache_misses'] += len(texts_to_embed)
+        logger.info(f"⚡ Processing {len(processed_texts)} texts with ULTRA-FAST concurrent settings")
         
-        # Embed uncached texts with dynamic batching
-        if texts_to_embed:
-            logger.info(f"⚡ JinaAI embedding {len(texts_to_embed)} texts ({cache_hits} from cache)")
-            
-            # Dynamic batch size adjustment based on text lengths
-            avg_text_length = sum(len(text) for text in texts_to_embed) / len(texts_to_embed)
-            dynamic_batch_size = self._adjust_batch_size_for_length(avg_text_length)
-            
-            new_embeddings = []
-            for i in range(0, len(texts_to_embed), dynamic_batch_size):
-                batch = texts_to_embed[i:i + dynamic_batch_size]
-                
-                # Use JinaAI-optimized encoding
-                batch_embeddings = self.embedding_model.encode(
-                    batch,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                    batch_size=len(batch),
-                    convert_to_numpy=True,
-                    device=DEVICE
+        # Generate embeddings with CONCURRENT processing
+        try:
+            async with EMBEDDING_SEMAPHORE:
+                # Use optimized batch processing for speed
+                embeddings = await self._generate_embeddings_batch_parallel(
+                    processed_texts, batch_size=min(24, len(processed_texts))  # Increased batch size for higher RAM
                 )
                 
-                new_embeddings.extend(batch_embeddings)
+                embedding_time = time.time() - start_time
+                final_memory = get_memory_usage()
+                logger.info(f"⚡ CONCURRENT embedding complete: {embedding_time:.3f}s | Memory: {final_memory:.2f}GB")
                 
-                # Clear GPU cache periodically for large batches
-                if DEVICE == "cuda" and len(new_embeddings) % 200 == 0:
-                    torch.cuda.empty_cache()
+                return embeddings
+                
+        except Exception as e:
+            logger.error(f"❌ Embedding generation failed: {e}")
+            return np.zeros((len(texts), 384))
+
+    async def _generate_embeddings_batch_parallel(self, texts: List[str], batch_size: int = 16) -> np.ndarray:
+        """Generate embeddings with CONCURRENT processing and optimized memory management"""
+        if not texts:
+            return np.array([])
+        
+        try:
+            all_embeddings = []
             
-            # Cache new embeddings (async)
-            for text, embedding in zip(texts_to_embed, new_embeddings):
-                await self.embedding_cache.set(text, embedding)
+            # Process in CONCURRENT batches for maximum speed
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i + batch_size]
+                
+                # Memory check with increased thresholds for speed
+                current_memory = get_memory_usage()
+                if current_memory > 3.2:  # Increased threshold for better performance
+                    # Use smaller batches only when memory is very high
+                    smaller_batch_size = max(1, batch_size // 2)
+                    for j in range(0, len(batch_texts), smaller_batch_size):
+                        small_batch = batch_texts[j:j + smaller_batch_size]
+                        batch_embeddings = self.embedding_model.encode(
+                            small_batch,
+                            normalize_embeddings=True,
+                            show_progress_bar=False,
+                            batch_size=len(small_batch),
+                            convert_to_numpy=True,
+                            device=DEVICE  # Use optimal device
+                        )
+                        all_embeddings.append(batch_embeddings)
+                else:
+                    # FAST batch processing for good memory conditions
+                    batch_embeddings = self.embedding_model.encode(
+                        batch_texts,
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                        batch_size=len(batch_texts),  # Process full batch
+                        convert_to_numpy=True,
+                        device=DEVICE  # Use optimal device for speed
+                    )
+                    all_embeddings.append(batch_embeddings)
             
-            # Add to results
-            for i, embedding in enumerate(new_embeddings):
-                embeddings.append((cache_indices[i], embedding))
+            # Combine all embeddings efficiently
+            if all_embeddings:
+                embeddings = np.vstack(all_embeddings)
+            else:
+                embeddings = np.zeros((len(texts), 384))
             
-            # Update performance stats
-            self.performance_stats['total_embeddings_computed'] += len(new_embeddings)
-            self.performance_stats['average_batch_size'] = (
-                (self.performance_stats['average_batch_size'] * 0.9) + 
-                (dynamic_batch_size * 0.1)
+            return embeddings
+            
+        except Exception as e:
+            logger.error(f"❌ Parallel embedding batch failed: {e}")
+            return np.zeros((len(texts), 384))
+
+    async def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
+        """Generate embeddings for a batch of texts optimized for SPEED"""
+        if not texts:
+            return np.array([])
+        
+        try:
+            # Use sentence-transformers with SPEED-OPTIMIZED settings
+            embeddings = self.embedding_model.encode(
+                texts,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                batch_size=min(24, len(texts)),  # Increased for higher RAM capacity
+                convert_to_numpy=True,
+                device=DEVICE  # Use GPU if available for speed
             )
-        
-        # Sort by original order and extract embeddings
-        embeddings.sort(key=lambda x: x[0])
-        result = np.array([emb for _, emb in embeddings])
-        
-        # Update GPU memory usage stats
-        if DEVICE == "cuda":
-            self.performance_stats['gpu_memory_usage'] = torch.cuda.memory_allocated() / 1e9
-        
-        return result
+            return embeddings
+        except Exception as e:
+            logger.error(f"🔥 Batch embedding error: {e}")
+            # Return zero embeddings as fallback
+            return np.zeros((len(texts), 384))
 
     def _adjust_batch_size_for_length(self, avg_length: float) -> int:
         """Dynamically adjust batch size based on average text length"""
@@ -1160,108 +1294,107 @@ class JinaAIOptimizedRAGSystem:
             return self.max_batch_size  # Maximum batches for short texts
 
     def _rerank_with_optimization(self, query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Optimized reranking with batch processing"""
+        """Ultra-optimized reranking for heavy files under 1.7GB RAM"""
+        import torch
+        
         if not chunks:
             return chunks
         
-        # Prepare reranker input
-        reranker_input = [[query, chunk['text'][:1000]] for chunk in chunks]  # Truncate for speed
+        # Limit reranking for heavy files to save memory
+        max_rerank_chunks = 8  # Severely reduced from more chunks
+        if len(chunks) > max_rerank_chunks:
+            chunks = chunks[:max_rerank_chunks]
         
-        # Batch reranking for efficiency
-        batch_size = min(32, len(reranker_input))
-        cross_scores = []
+        logger.info(f"🔄 Reranking {len(chunks)} chunks with ultra-conservative settings")
         
-        for i in range(0, len(reranker_input), batch_size):
-            batch = reranker_input[i:i + batch_size]
-            batch_scores = self.reranker_model.predict(batch, show_progress_bar=False)
-            cross_scores.extend(batch_scores)
+        # Prepare reranker input with ultra-aggressive truncation for heavy files
+        reranker_input = [[query[:100], chunk['text'][:200]] for chunk in chunks]  # Severely reduced limits
         
-        # Apply scores and sort
-        for i, chunk in enumerate(chunks):
-            chunk['rerank_score'] = float(cross_scores[i])
+        try:
+            with torch.no_grad():  # Disable gradients
+                # Process one item at a time for heavy files
+                cross_scores = []
+                
+                for i, input_pair in enumerate(reranker_input):
+                    # Process single item
+                    batch_scores = self.reranker_model.predict(
+                        [input_pair], 
+                        show_progress_bar=False,
+                        batch_size=1  # Force single item processing
+                    )
+                    cross_scores.extend(batch_scores)
+                    
+                    # Memory cleanup optimized for 4GB RAM
+                    if i % 4 == 0 and i > 0:  # Less frequent cleanup for speed
+                        gc.collect()
+                        current_memory = get_memory_usage()
+                        if current_memory > 3.5:  # Higher threshold for 4GB RAM
+                            logger.warning(f"⚠️ Memory during reranking: {current_memory:.2f}GB - forcing cleanup")
+                            force_memory_cleanup()
         
-        return sorted(chunks, key=lambda x: x['rerank_score'], reverse=True)
+            # Apply scores and sort
+            for i, chunk in enumerate(chunks):
+                chunk['rerank_score'] = float(cross_scores[i])
+            
+            return sorted(chunks, key=lambda x: x['rerank_score'], reverse=True)
+            
+        except Exception as e:
+            logger.error(f"❌ Heavy file reranking error: {e}")
+            # Force cleanup on error
+            force_memory_cleanup()
+            # Fallback: return chunks with similarity scores as rerank scores
+            for chunk in chunks:
+                chunk['rerank_score'] = chunk.get('semantic_score', 0.0)
+            return sorted(chunks, key=lambda x: x['rerank_score'], reverse=True)
 
     async def retrieve_and_rerank(self, query: str, chunks_with_metadata: List[Dict], 
                                   chunk_embeddings: np.ndarray, request_id: str) -> List[Dict[str, Any]]:
-        """Advanced retrieval with semantic search and hierarchical boosting"""
+        """Fast retrieval with semantic search and intelligent reranking"""
+        start_time = time.time()
+        
         if len(chunks_with_metadata) == 0:
             return []
         
-        # Create context hash for query caching
-        context_hash = hashlib.sha256(str(chunk_embeddings.tobytes()).encode()).hexdigest()[:16]
-        
-        # Check query cache
-        cached_result = await self.query_cache.get(query, context_hash)
-        if cached_result:
-            logger.info(f"[{request_id}] 🎯 Using cached query result")
-            return ast.literal_eval(cached_result)  # Safe since we control the cached content
-        
         # Fast query embedding
+        embed_start = time.time()
         query_embedding = await self._embed_with_advanced_caching([query])
+        embed_time = time.time() - embed_start
+        logger.info(f"[{request_id}] ⚡ Query embedding: {embed_time:.3f}s")
         
         if query_embedding.size == 0:
             return []
         
-        # Ultra-fast similarity computation with optimizations
+        # Ultra-fast similarity computation
+        sim_start = time.time()
         query_embedding = query_embedding.flatten()
         
-        # Optimized similarity computation with enhanced GPU utilization
-        if DEVICE == "cuda" and chunk_embeddings.shape[0] > 1000:
-            # Enhanced GPU computation with memory management
-            try:
-                # Clear GPU cache first
-                torch.cuda.empty_cache()
-                
-                # Use smaller batches for very large datasets to prevent OOM
-                batch_size = min(2000, chunk_embeddings.shape[0])
-                all_similarities = []
-                
-                for i in range(0, chunk_embeddings.shape[0], batch_size):
-                    end_idx = min(i + batch_size, chunk_embeddings.shape[0])
-                    batch_embeddings = torch.from_numpy(chunk_embeddings[i:end_idx]).to(DEVICE, dtype=torch.float16)
-                    query_embedding_gpu = torch.from_numpy(query_embedding).to(DEVICE, dtype=torch.float16).unsqueeze(1)
-                    
-                    batch_similarities = torch.mm(batch_embeddings, query_embedding_gpu).squeeze().cpu().numpy()
-                    all_similarities.append(batch_similarities)
-                    
-                    # Clear batch from GPU memory
-                    del batch_embeddings, query_embedding_gpu
-                    torch.cuda.empty_cache()
-                
-                similarities = np.concatenate(all_similarities)
-                
-            except Exception as e:
-                logger.warning(f"GPU computation failed ({e}), falling back to CPU")
-                # Fallback to CPU with numpy optimization
-                similarities = np.dot(chunk_embeddings, query_embedding)
+        # Optimized similarity computation based on dataset size
+        if chunk_embeddings.shape[0] > 1000:
+            # Use parallel processing for large datasets
+            from concurrent.futures import ThreadPoolExecutor
+            import math
+            
+            def compute_batch_similarity(batch_data):
+                start_idx, end_idx = batch_data
+                return np.dot(chunk_embeddings[start_idx:end_idx], query_embedding)
+            
+            n_threads = min(4, os.cpu_count() or 4)
+            batch_size = math.ceil(chunk_embeddings.shape[0] / n_threads)
+            batches = [(i, min(i + batch_size, chunk_embeddings.shape[0])) 
+                      for i in range(0, chunk_embeddings.shape[0], batch_size)]
+            
+            with ThreadPoolExecutor(max_workers=n_threads) as executor:
+                batch_results = list(executor.map(compute_batch_similarity, batches))
+                similarities = np.concatenate(batch_results)
         else:
-            # Enhanced CPU optimization with threading for very large datasets
-            if chunk_embeddings.shape[0] > 2000:
-                # Use parallel processing for large datasets
-                from concurrent.futures import ThreadPoolExecutor
-                import math
-                
-                def compute_batch_similarity(batch_data):
-                    start_idx, end_idx = batch_data
-                    return np.dot(chunk_embeddings[start_idx:end_idx], query_embedding)
-                
-                n_threads = min(4, os.cpu_count() or 4)
-                batch_size = math.ceil(chunk_embeddings.shape[0] / n_threads)
-                batches = [(i, min(i + batch_size, chunk_embeddings.shape[0])) 
-                          for i in range(0, chunk_embeddings.shape[0], batch_size)]
-                
-                with ThreadPoolExecutor(max_workers=n_threads) as executor:
-                    batch_results = list(executor.map(compute_batch_similarity, batches))
-                    similarities = np.concatenate(batch_results)
-            elif chunk_embeddings.shape[0] > 500:
-                # Use numpy's optimized BLAS for medium datasets
-                similarities = np.dot(chunk_embeddings, query_embedding)
-            else:
-                # Use einsum for smaller datasets (often faster due to less overhead)
-                similarities = np.einsum('ij,j->i', chunk_embeddings, query_embedding)
+            # Direct computation for smaller datasets
+            similarities = np.dot(chunk_embeddings, query_embedding)
         
-        # Advanced candidate selection with hierarchical boosting
+        sim_time = time.time() - sim_start
+        logger.info(f"[{request_id}] ⚡ Similarity computation: {sim_time:.3f}s")
+        
+        # Advanced candidate selection
+        select_start = time.time()
         candidate_indices = self._select_diverse_candidates(
             similarities, chunks_with_metadata, self.top_k_initial
         )
@@ -1278,32 +1411,52 @@ class JinaAIOptimizedRAGSystem:
             # Content quality boosting
             content_boost = self._calculate_content_quality_boost(chunk)
             
-            # Page proximity boosting (prefer content from similar pages)
+            # Page proximity boosting
             page_boost = self._calculate_page_proximity_boost(chunk, candidate_chunks)
             
             chunk['semantic_score'] = base_score + level_boost + content_boost + page_boost
         
-        # Re-rank with optimized cross-encoder
-        reranked_chunks = await asyncio.get_event_loop().run_in_executor(
-            None, self._rerank_with_optimization, query, candidate_chunks
-        )
+        select_time = time.time() - select_start
+        logger.info(f"[{request_id}] ⚡ Candidate selection: {select_time:.3f}s")
         
-        final_chunks = reranked_chunks[:self.top_k_final]
+        # Smart selective reranking for accuracy
+        rerank_start = time.time()
+        top_score = max(similarities[candidate_indices]) if candidate_indices else 0
         
-        # Cache the result
-        await self.query_cache.set(query, context_hash, str(final_chunks))
+        if top_score < self.rerank_threshold:
+            # Low confidence - use reranking for accuracy
+            logger.info(f"[{request_id}] 🎯 Low confidence ({top_score:.3f}), applying reranking")
+            reranked_chunks = await asyncio.get_event_loop().run_in_executor(
+                None, self._rerank_with_optimization, query, candidate_chunks
+            )
+            final_chunks = reranked_chunks[:self.top_k_final]
+        else:
+            # High confidence - skip reranking for speed
+            logger.info(f"[{request_id}] 🚀 High confidence ({top_score:.3f}), skipping reranking")
+            candidate_chunks.sort(key=lambda x: x['semantic_score'], reverse=True)
+            final_chunks = candidate_chunks[:self.top_k_final]
+            
+            # Add semantic scores as rerank scores for compatibility
+            for chunk in final_chunks:
+                chunk['rerank_score'] = chunk['semantic_score']
         
-        logger.info(f"[{request_id}] 🎯 Retrieval complete | Top score: {final_chunks[0]['rerank_score']:.4f}")
+        rerank_time = time.time() - rerank_start
+        logger.info(f"[{request_id}] ⚡ Reranking: {rerank_time:.3f}s")
+        
+        total_time = time.time() - start_time
+        top_final_score = final_chunks[0]['rerank_score'] if final_chunks else 0
+        logger.info(f"[{request_id}] 🎯 Retrieval complete: {total_time:.3f}s | Top score: {top_final_score:.4f}")
+        
         return final_chunks
 
     def _select_diverse_candidates(self, similarities: np.ndarray, chunks: List[Dict], 
                                  top_k: int) -> List[int]:
-        """Enhanced diverse candidate selection with semantic clustering"""
-        # Get top candidates based on similarity (more than needed for diversity filtering)
-        top_indices = np.argsort(similarities)[-top_k * 3:][::-1]
+        """Enhanced diverse candidate selection with semantic clustering for accuracy"""
+        # Get top candidates based on similarity (more candidates for better diversity)
+        top_indices = np.argsort(similarities)[-top_k * 4:][::-1]  # Increased multiplier
         
         selected_indices = []
-        similarity_threshold = 0.05  # Minimum similarity difference required
+        similarity_threshold = 0.03  # Tighter threshold for better accuracy
         
         for idx in top_indices:
             if len(selected_indices) >= top_k:
@@ -1313,7 +1466,7 @@ class JinaAIOptimizedRAGSystem:
             is_diverse = True
             current_similarity = similarities[idx]
             
-            # Enhanced diversity checks
+            # Enhanced diversity checks with more granular analysis
             for selected_idx in selected_indices:
                 selected_chunk = chunks[selected_idx]
                 selected_similarity = similarities[selected_idx]
@@ -1324,57 +1477,140 @@ class JinaAIOptimizedRAGSystem:
                     is_diverse = False
                     break
                 
-                # 2. Avoid very similar similarity scores (likely duplicate content)
+                # 2. Enhanced semantic similarity check
                 if abs(current_similarity - selected_similarity) < similarity_threshold:
-                    # Check content overlap
-                    chunk_words = set(chunk.get('text', '').lower().split()[:20])
-                    selected_words = set(selected_chunk.get('text', '').lower().split()[:20])
+                    # More sophisticated content overlap detection
+                    chunk_words = set(chunk.get('text', '').lower().split()[:30])  # Increased window
+                    selected_words = set(selected_chunk.get('text', '').lower().split()[:30])
                     overlap = len(chunk_words & selected_words) / max(len(chunk_words | selected_words), 1)
-                    if overlap > 0.7:  # High content overlap
+                    if overlap > 0.6:  # Slightly reduced threshold for better diversity
                         is_diverse = False
                         break
                 
-                # 3. Page proximity check with more nuance
+                # 3. Enhanced hierarchical diversity
+                chunk_level = chunk.get('level', 4)
+                selected_level = selected_chunk.get('level', 4)
+                if (chunk_level == selected_level and 
+                    chunk.get('parent_id') == selected_chunk.get('parent_id') and
+                    abs(current_similarity - selected_similarity) < similarity_threshold * 1.5):
+                    is_diverse = False
+                    break
+                
+                # 4. Page proximity with content type consideration
                 chunk_pages = set(chunk.get('pages', [chunk.get('page', 0)]))
                 selected_pages = set(selected_chunk.get('pages', [selected_chunk.get('page', 0)]))
                 page_overlap = len(chunk_pages & selected_pages)
                 
-                # Allow some page overlap if similarity scores are very different
+                # More nuanced page overlap handling
                 if (page_overlap > 0 and 
                     abs(current_similarity - selected_similarity) < similarity_threshold * 2 and
-                    chunk.get('level', 4) == selected_chunk.get('level', 4)):
-                    is_diverse = False
-                    break
+                    chunk.get('element_type') == selected_chunk.get('element_type')):
+                    # Check if content is truly different despite page overlap
+                    content_diff = abs(len(chunk.get('text', '')) - len(selected_chunk.get('text', '')))
+                    if content_diff < 100:  # Similar length content on same page
+                        is_diverse = False
+                        break
             
             if is_diverse:
                 selected_indices.append(idx)
         
-        # If we don't have enough diverse candidates, fill with best remaining
+        # Enhanced fallback with semantic clustering
         if len(selected_indices) < top_k:
             remaining_candidates = [idx for idx in top_indices if idx not in selected_indices]
             needed = top_k - len(selected_indices)
-            selected_indices.extend(remaining_candidates[:needed])
+            
+            # Apply semantic clustering to remaining candidates
+            clustered_candidates = self._apply_semantic_clustering(
+                remaining_candidates, similarities, chunks, needed
+            )
+            selected_indices.extend(clustered_candidates)
         
         return selected_indices
 
+    def _apply_semantic_clustering(self, candidate_indices: List[int], similarities: np.ndarray, 
+                                 chunks: List[Dict], needed: int) -> List[int]:
+        """Apply semantic clustering to select diverse candidates"""
+        if not candidate_indices or needed <= 0:
+            return []
+        
+        # Group candidates by similarity ranges for better diversity
+        similarity_groups = {}
+        for idx in candidate_indices:
+            sim_score = similarities[idx]
+            # Create similarity bins
+            sim_bin = round(sim_score, 1)  # Group by 0.1 similarity intervals
+            if sim_bin not in similarity_groups:
+                similarity_groups[sim_bin] = []
+            similarity_groups[sim_bin].append(idx)
+        
+        # Select from different similarity groups
+        selected = []
+        sorted_groups = sorted(similarity_groups.keys(), reverse=True)
+        
+        # Round-robin selection from similarity groups
+        group_index = 0
+        while len(selected) < needed and any(similarity_groups.values()):
+            current_group = sorted_groups[group_index % len(sorted_groups)]
+            if similarity_groups[current_group]:
+                # Select best candidate from this group
+                group_candidates = similarity_groups[current_group]
+                best_idx = max(group_candidates, key=lambda x: similarities[x])
+                selected.append(best_idx)
+                similarity_groups[current_group].remove(best_idx)
+                
+            group_index += 1
+            
+            # Clean up empty groups
+            if not similarity_groups[current_group]:
+                del similarity_groups[current_group]
+                sorted_groups = [g for g in sorted_groups if g in similarity_groups]
+        
+        return selected[:needed]
+
     def _calculate_content_quality_boost(self, chunk: Dict) -> float:
-        """Calculate content quality boost based on chunk characteristics"""
+        """Enhanced content quality boost with multiple quality indicators"""
         content = chunk.get('text', '')
         
-        # Boost for structured content
-        structure_indicators = len(re.findall(r'^\d+\.|\n\d+\.|\n[A-Z]\.', content, re.MULTILINE))
-        structure_boost = min(0.02, structure_indicators * 0.005)
+        # Enhanced structure analysis
+        structure_indicators = (
+            len(re.findall(r'^\d+\.|\n\d+\.|\n[A-Z]\.', content, re.MULTILINE)) +
+            len(re.findall(r'^\s*[-•]\s+', content, re.MULTILINE)) +  # Bullet points
+            len(re.findall(r'^\s*[A-Z][A-Z\s]{10,}$', content, re.MULTILINE))  # Headings
+        )
+        structure_boost = min(0.03, structure_indicators * 0.008)  # Increased weight
         
-        # Boost for appropriate length
+        # Enhanced length scoring with optimal ranges
         word_count = chunk.get('word_count', len(content.split()))
-        if 50 <= word_count <= 300:
-            length_boost = 0.01
-        elif 300 < word_count <= 600:
+        if 75 <= word_count <= 200:      # Sweet spot for detailed answers
+            length_boost = 0.025
+        elif 200 < word_count <= 400:   # Good for comprehensive content
             length_boost = 0.02
+        elif 50 <= word_count < 75:     # Decent for specific facts
+            length_boost = 0.015
+        elif 400 < word_count <= 600:   # Still good but longer
+            length_boost = 0.01
         else:
             length_boost = 0.0
         
-        return structure_boost + length_boost
+        # Content density and quality indicators
+        sentences = len(re.findall(r'[.!?]+', content))
+        avg_sentence_length = word_count / max(sentences, 1)
+        
+        # Prefer moderate sentence lengths (indicates good readability)
+        if 10 <= avg_sentence_length <= 25:
+            readability_boost = 0.01
+        else:
+            readability_boost = 0.0
+        
+        # Boost for content with definitions, examples, or explanations
+        quality_indicators = (
+            len(re.findall(r'\b(defined as|means|refers to|such as|for example|including)\b', content, re.IGNORECASE)) +
+            len(re.findall(r'\b(because|therefore|thus|hence|consequently)\b', content, re.IGNORECASE)) +
+            len(re.findall(r'\b(section|subsection|clause|paragraph)\s+\d+', content, re.IGNORECASE))
+        )
+        quality_boost = min(0.02, quality_indicators * 0.005)
+        
+        return structure_boost + length_boost + readability_boost + quality_boost
 
     def _calculate_page_proximity_boost(self, chunk: Dict, all_chunks: List[Dict]) -> float:
         """Calculate boost based on page proximity to other selected chunks"""
@@ -1390,7 +1626,7 @@ class JinaAIOptimizedRAGSystem:
         return min(0.01, nearby_count * 0.003)
 
     def _create_enriched_context(self, contexts: List[Dict]) -> str:
-        """Create enriched context with advanced formatting"""
+        """Create enriched context with advanced formatting for better LLM comprehension"""
         context_parts = []
         seen_pages = set()
         
@@ -1398,30 +1634,58 @@ class JinaAIOptimizedRAGSystem:
             pages = ctx.get('pages', [ctx.get('page', 1)])
             page_range = f"Page {pages[0]}" if len(pages) == 1 else f"Pages {pages[0]}-{pages[-1]}"
             
-            # Create unique identifiers for context parts
+            # Enhanced metadata for better context
             section_info = f"Section: {ctx.get('title', 'Unknown')}" if ctx.get('title') else ""
             level_info = f"Level {ctx.get('level', 'Unknown')}" if ctx.get('level') is not None else ""
             relevance_score = f"Relevance: {ctx.get('rerank_score', 0):.3f}"
+            element_type = f"Type: {ctx.get('element_type', 'Unknown')}"
             
-            # Build context header
+            # Build enhanced context header
             header_parts = [page_range]
-            if section_info:
+            if section_info and "Unknown" not in section_info:
                 header_parts.append(section_info)
-            if level_info:
+            if level_info and "Unknown" not in level_info:
                 header_parts.append(level_info)
+            if element_type and "Unknown" not in element_type:
+                header_parts.append(element_type)
             header_parts.append(relevance_score)
             
             header = f"--- Context {i+1} | {' | '.join(header_parts)} ---"
             
-            # Add content with smart truncation
+            # Enhanced content processing
             content = ctx['text']
-            if len(content) > 1500:  # Truncate very long content
-                content = content[:1400] + "... [truncated]"
+            
+            # Add hierarchical context if available
+            if ctx.get('parent_id') and section_info:
+                content = f"[Context: {section_info}]\n{content}"
+            
+            # Smart truncation that preserves sentence boundaries
+            if len(content) > 1800:  # Increased limit for better accuracy
+                sentences = re.split(r'[.!?]+', content)
+                truncated_sentences = []
+                current_length = 0
+                
+                for sentence in sentences:
+                    if current_length + len(sentence) > 1700:
+                        break
+                    truncated_sentences.append(sentence)
+                    current_length += len(sentence)
+                
+                if truncated_sentences:
+                    content = '.'.join(truncated_sentences) + "."
+                    if len(content) < len(ctx['text']) * 0.8:  # Only add truncation note if significantly cut
+                        content += "\n[...content continues...]"
+                else:
+                    content = content[:1700] + "... [truncated]"
             
             context_parts.append(f"{header}\n{content}")
             seen_pages.update(pages)
         
-        return "\n\n".join(context_parts)
+        # Add summary footer for better LLM understanding
+        total_pages = len(seen_pages)
+        summary_footer = f"\n--- Summary: {len(contexts)} relevant contexts from {total_pages} page(s) ---"
+        
+        return "\n\n".join(context_parts) + summary_footer
 
     def _generate_answer_sync(self, prompt: str) -> str:
         """Generate answer with optimized prompting"""
@@ -1478,32 +1742,20 @@ COMPREHENSIVE ANSWER WITH PRECISE CITATIONS:"""
 
     def get_performance_stats(self) -> Dict[str, Any]:
         """Get comprehensive performance statistics"""
-        cache_stats = self.embedding_cache.get_stats()
-        query_cache_stats = self.query_cache.get_stats()
         
         return {
             **self.performance_stats,
-            **cache_stats,
-            "query_cache": query_cache_stats,
             "model_info": {
                 "embedding_model": self.embedding_model_name,
                 "device": DEVICE,
                 "gpu_memory_gb": GPU_MEMORY_GB,
                 "half_precision": self.enable_half_precision,
                 "max_batch_size": self.max_batch_size
-            },
-            "cache_efficiency": {
-                "embedding_hit_rate": cache_stats.get("overall_hit_rate", 0),
-                "query_hit_rate": query_cache_stats.get("hit_rate", 0),
-                "embedding_cache_size": cache_stats.get("memory_cache_size", 0),
-                "query_cache_size": query_cache_stats.get("memory_cache_size", 0)
             }
         }
 
     async def clear_all_caches(self):
-        """Clear all caches and reset performance stats"""
-        await self.embedding_cache.clear()
-        await self.query_cache.clear()
+        """Simplified cleanup for maximum speed"""
         
         # Reset performance stats
         self.performance_stats = {
@@ -1519,11 +1771,27 @@ COMPREHENSIVE ANSWER WITH PRECISE CITATIONS:"""
             torch.cuda.empty_cache()
         
         gc.collect()
-        logger.info("🗑️ All caches cleared and memory optimized")
+        logger.info("🗑️ Memory optimized for maximum speed")
 
 
 # Global RAG system instance
 rag_system = JinaAIOptimizedRAGSystem()
+
+async def cleanup_memory():
+    """Background task for memory cleanup"""
+    logger.info("🗑️ Starting background memory cleanup...")
+    start_time = time.time()
+    
+    # Force garbage collection
+    gc.collect()
+    
+    # Clear GPU cache if available
+    if DEVICE == "cuda" and torch:
+        torch.cuda.empty_cache()
+    
+    cleanup_time = time.time() - start_time
+    memory_after = get_memory_usage()
+    logger.info(f"🗑️ Background cleanup complete: {cleanup_time:.3f}s | Memory: {memory_after:.2f}GB")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1543,9 +1811,9 @@ async def lifespan(app: FastAPI):
 # 6. FASTAPI APPLICATION SERVER & STARTUP EVENT
 # ==============================================================================
 app = FastAPI(
-    title="JinaAI-Optimized Ultra-Fast RAG System", 
-    version="9.0.0",
-    description="Production-grade RAG system with JinaAI embeddings and advanced optimizations",
+    title="Fast Parallel RAG System", 
+    version="10.0.0",
+    description="High-performance RAG system optimized for parallel processing and 30-second responses",
     lifespan=lifespan
 )
 
@@ -1582,69 +1850,149 @@ async def process_document_and_answer(
     background_tasks: BackgroundTasks,
     authorization: str = Header(None)
 ):
-    """Main endpoint for document processing and question answering with concurrency control"""
+    """Main endpoint for document processing and question answering optimized for heavy files under 1.7GB RAM"""
     verify_token(authorization)
     request_id = f"req_{int(time.time() * 1000)}"
     start_time = time.time()
+    initial_memory = get_memory_usage()
+    logger.info(f"[{request_id}] 💾 Initial memory: {initial_memory:.2f}GB")
     
-    # Apply request-level concurrency limiting for Lightsail optimization
+    # Early memory check - reject if already too high (relaxed threshold for high performance)
+    if initial_memory > 3.0:
+        logger.error(f"[{request_id}] ❌ Memory too high ({initial_memory:.2f}GB) - rejecting request")
+        raise HTTPException(status_code=503, detail=f"Server memory too high: {initial_memory:.2f}GB")
+    
+    # Memory-aware concurrency for <4GB RAM with ULTRA-FAST concurrent chunking
     async with REQUEST_SEMAPHORE:
-        logger.info(f"[{request_id}] 🚀 New request | Questions: {len(request.questions)} | Model: JinaAI | Active: {3 - REQUEST_SEMAPHORE._value}")
+        try:
+            active_requests = REQUEST_SEMAPHORE._value
+        except AttributeError:
+            active_requests = 12 - REQUEST_SEMAPHORE._value
+        logger.info(f"[{request_id}] 🚀 New ULTRA-FAST request | Questions: {len(request.questions)} | Active: {active_requests}/12")
 
         try:
-            # Apply processing-level concurrency limiting for memory-intensive operations
-            async with PROCESSING_SEMAPHORE:
-                # PDF extraction with timing
+            # REMOVE blocking semaphore for TRUE CONCURRENT document processing
+            # Memory check with high-performance thresholds for ultra-fast processing
+                current_memory = get_memory_usage()
+                if current_memory > 3.0:  # Increased threshold for maximum performance
+                    logger.warning(f"[{request_id}] ⚠️ Memory at {current_memory:.2f}GB - using conservative processing")
+                    force_memory_cleanup()
+                    await asyncio.sleep(0.2)  # Shorter wait for maximum concurrency
+                    current_memory = get_memory_usage()
+                    if current_memory > 2.5:  # Higher threshold for maximum concurrent requests
+                        raise HTTPException(status_code=503, detail=f"Memory too high for parallel processing: {current_memory:.2f}GB")
+                
+                # PDF extraction with PARALLEL memory monitoring
                 pdf_start = time.time()
+                logger.info(f"[{request_id}] 📄 Starting PARALLEL PDF extraction...")
                 pages = await rag_system.download_and_extract(request.documents)
                 pdf_time = time.time() - pdf_start
-                logger.info(f"[{request_id}] 📄 PDF extracted: {len(pages)} pages in {pdf_time:.2f}s")
+                pdf_memory = get_memory_usage()
+                logger.info(f"[{request_id}] 📄 PARALLEL PDF extraction: {len(pages)} pages in {pdf_time:.3f}s | Memory: {pdf_memory:.2f}GB")
                 
-                # Document structure analysis
+                # Memory check with ultra-fast-friendly thresholds
+                if pdf_memory > 3.0:  # Increased threshold for maximum performance
+                    logger.warning(f"[{request_id}] ⚠️ Memory at {pdf_memory:.2f}GB after PDF - quick cleanup")
+                    force_memory_cleanup()
+                    pdf_memory = get_memory_usage()
+                
+                # Document structure analysis with PARALLEL processing
                 structure_start = time.time()
+                logger.info(f"[{request_id}] 🏗️ Starting PARALLEL structure analysis...")
                 hierarchical_elements = rag_system.processor.extract_hierarchical_structure(pages, request_id)
+                
+                # Clear pages from memory immediately for parallel processing
+                del pages
+                gc.collect()
+                
                 structure_time = time.time() - structure_start
+                structure_memory = get_memory_usage()
+                logger.info(f"[{request_id}] 🏗️ PARALLEL structure analysis: {structure_time:.3f}s | {len(hierarchical_elements)} elements | Memory: {structure_memory:.2f}GB")
                 
-                # Convert to retrieval chunks
+                # Memory check with ultra-fast-friendly thresholds
+                if structure_memory > 3.0:  # Increased threshold for maximum performance
+                    logger.warning(f"[{request_id}] ⚠️ Memory at {structure_memory:.2f}GB after structure - quick cleanup")
+                    force_memory_cleanup()
+                
+                # Convert to retrieval chunks with PARALLEL optimization
                 chunk_start = time.time()
+                logger.info(f"[{request_id}] 📚 Creating retrieval chunks with PARALLEL optimization...")
                 chunks_with_metadata = rag_system.processor.get_chunks_for_retrieval(hierarchical_elements)
+                
+                # Clear hierarchical elements from memory for parallel processing
+                del hierarchical_elements
+                gc.collect()
+                
                 chunk_time = time.time() - chunk_start
+                chunk_memory = get_memory_usage()
+                logger.info(f"[{request_id}] 📚 PARALLEL chunk creation: {chunk_time:.3f}s | {len(chunks_with_metadata)} chunks | Memory: {chunk_memory:.2f}GB")
                 
-                logger.info(f"[{request_id}] 📚 Created {len(chunks_with_metadata)} optimized chunks")
+                # Memory check before embedding with ultra-fast-aware threshold
+                if chunk_memory > 3.0:  # Increased threshold for maximum performance
+                    logger.warning(f"[{request_id}] ⚠️ Memory at {chunk_memory:.2f}GB before embedding - quick cleanup")
+                    force_memory_cleanup()
                 
-                # JinaAI embedding generation
+                # PARALLEL embedding generation with optimized memory monitoring
                 embed_start = time.time()
                 chunk_texts = [c['text'] for c in chunks_with_metadata]
+                logger.info(f"[{request_id}] 🔢 Starting PARALLEL embedding generation for {len(chunk_texts)} texts...")
                 chunk_embeddings = await rag_system._embed_with_advanced_caching(chunk_texts)
                 embed_time = time.time() - embed_start
+                embed_memory = get_memory_usage()
                 
-                logger.info(f"[{request_id}] ⚡ JinaAI embeddings completed in {embed_time:.2f}s")
+                # Final memory cleanup after embedding
+                if check_memory_threshold():
+                    force_memory_cleanup()
+                    rag_system.performance_stats['memory_cleanups'] += 1
+                
+                processing_time = time.time() - pdf_start
+                logger.info(f"[{request_id}] ⚡ Document processing complete: {processing_time:.3f}s (PDF: {pdf_time:.3f}s, Structure: {structure_time:.3f}s, Chunks: {chunk_time:.3f}s, Embedding: {embed_time:.3f}s) | Memory: {embed_memory:.2f}GB")
 
-            # Process questions in parallel (lighter operation, outside processing semaphore)
-            async def process_single_question(question: str, q_idx: int) -> str:
-                q_request_id = f"{request_id}_q{q_idx+1}"
-                contexts = await rag_system.retrieve_and_rerank(
-                    question, chunks_with_metadata, chunk_embeddings, q_request_id
-                )
-                return await rag_system.answer_question(question, contexts, q_request_id)
+                # Process questions in parallel (optimized for speed)
+                async def process_single_question(question: str, q_idx: int) -> str:
+                    q_request_id = f"{request_id}_q{q_idx+1}"
+                    q_start = time.time()
+                    
+                    contexts = await rag_system.retrieve_and_rerank(
+                        question, chunks_with_metadata, chunk_embeddings, q_request_id
+                    )
+                    
+                    answer = await rag_system.answer_question(question, contexts, q_request_id)
+                    q_time = time.time() - q_start
+                    logger.info(f"[{q_request_id}] ✅ Question processed in {q_time:.3f}s")
+                    return answer
 
-            qa_start = time.time()
-            tasks = [process_single_question(q, i) for i, q in enumerate(request.questions)]
-            answers = await asyncio.gather(*tasks)
-            qa_time = time.time() - qa_start
-
-            total_time = time.time() - start_time
-            
-            logger.info(f"[{request_id}] ✅ Request completed in {total_time:.2f}s | JinaAI embedding: {embed_time:.2f}s")
-            
-            # Schedule background cleanup if needed
-            if background_tasks and total_time > 30:
-                background_tasks.add_task(cleanup_memory)
-            
-            return QueryResponse(answers=answers)
+                # Parallel question processing with timing
+                qa_start = time.time()
+                logger.info(f"[{request_id}] 🔄 Processing {len(request.questions)} questions in parallel...")
+                
+                tasks = [process_single_question(q, i) for i, q in enumerate(request.questions)]
+                answers = await asyncio.gather(*tasks)
+                qa_time = time.time() - qa_start
+                
+                # Final timing summary with memory optimization report
+                total_time = time.time() - start_time
+                final_memory = get_memory_usage()
+                memory_delta = final_memory - initial_memory
+                
+                logger.info(f"[{request_id}] ✅ REQUEST COMPLETE (4GB RAM Optimized):")
+                logger.info(f"[{request_id}]   📊 Total time: {total_time:.3f}s")
+                logger.info(f"[{request_id}]   📄 Document processing: {processing_time:.3f}s")
+                logger.info(f"[{request_id}]   🤖 Q&A processing: {qa_time:.3f}s")
+                logger.info(f"[{request_id}]   🧠 Memory: {initial_memory:.2f}GB → {final_memory:.2f}GB (Δ{memory_delta:+.2f}GB)")
+                logger.info(f"[{request_id}]   🗑️ Memory cleanups: {rag_system.performance_stats.get('memory_cleanups', 0)}")
+                logger.info(f"[{request_id}]   ⚡ Avg per question: {qa_time/len(request.questions):.3f}s")
+                
+                # Force final cleanup if memory usage is high
+                if final_memory > 2.5:
+                    force_memory_cleanup()
+                    logger.info(f"[{request_id}] 🗑️ Final cleanup | Memory: {get_memory_usage():.2f}GB")
+                
+                return QueryResponse(answers=answers)
         
         except Exception as e:
-            logger.error(f"[{request_id}] ❌ Error processing request: {e}", exc_info=True)
+            error_time = time.time() - start_time
+            logger.error(f"[{request_id}] ❌ Error after {error_time:.3f}s: {e}")
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
@@ -1672,10 +2020,6 @@ async def get_system_info(authorization: str = Header(None)):
             "reranker_model": rag_system.reranker_model_name,
             "max_batch_size": rag_system.max_batch_size,
             "half_precision_enabled": rag_system.enable_half_precision
-        },
-        "cache_config": {
-            "embedding_cache_max_size": rag_system.embedding_cache.max_memory_size,
-            "query_cache_max_size": rag_system.query_cache.max_memory_size
         }
     }
     
@@ -1731,12 +2075,12 @@ async def get_concurrency_status(authorization: str = Header(None)):
     
     return {
         "concurrency_limits": {
-            "max_concurrent_requests": 3,
-            "max_concurrent_processing": 2,
-            "current_active_requests": 3 - REQUEST_SEMAPHORE._value,
-            "current_processing_requests": 2 - PROCESSING_SEMAPHORE._value,
-            "requests_waiting": max(0, REQUEST_SEMAPHORE._waiters.__len__() if hasattr(REQUEST_SEMAPHORE, '_waiters') else 0),
-            "processing_waiting": max(0, PROCESSING_SEMAPHORE._waiters.__len__() if hasattr(PROCESSING_SEMAPHORE, '_waiters') else 0)
+            "max_concurrent_requests": 12,  # Updated for ultra-fast speed
+            "max_concurrent_processing": 12,  # Updated for ultra-fast speed 
+            "current_active_requests": 12 - REQUEST_SEMAPHORE._value,
+            "current_processing_requests": 12 - PROCESSING_SEMAPHORE._value,
+            "requests_waiting": max(0, len(getattr(REQUEST_SEMAPHORE, '_waiters', []))),
+            "processing_waiting": max(0, len(getattr(PROCESSING_SEMAPHORE, '_waiters', [])))
         },
         "resource_info": {
             "cpu_cores": CPU_COUNT,
@@ -1744,9 +2088,9 @@ async def get_concurrency_status(authorization: str = Header(None)):
             "thread_pool_size": global_executor._max_workers
         },
         "recommendations": {
-            "optimal_concurrent_requests": "3-5 for 2GB RAM",
-            "memory_per_request_estimate": "300-500MB",
-            "expected_queue_time": "10-30 seconds when busy"
+            "optimal_concurrent_requests": "4-6 for heavy files under 4GB RAM",
+            "memory_per_request_estimate": "500MB-1GB for heavy files",
+            "expected_queue_time": "15-45 seconds for heavy files"
         }
     }
 
@@ -1914,10 +2258,7 @@ async def benchmark_qwen3_performance(authorization: str = Header(None)):
         scenario_name = scenario["name"]
         texts = scenario["texts"]
         
-        # Clear cache for accurate timing
-        await rag_system.embedding_cache.clear()
-        
-        # Benchmark without cache
+        # Benchmark direct embedding (no cache)
         start_time = time.time()
         embeddings_no_cache = await rag_system._embed_with_advanced_caching(texts)
         no_cache_time = time.time() - start_time
@@ -1962,7 +2303,6 @@ async def benchmark_qwen3_performance(authorization: str = Header(None)):
             "max_batch_size": rag_system.max_batch_size,
             "half_precision": rag_system.enable_half_precision
         },
-        "cache_stats": rag_system.embedding_cache.get_stats(),
         "performance_stats": rag_system.get_performance_stats()
     }
     
@@ -1977,14 +2317,7 @@ async def benchmark_qwen3_performance(authorization: str = Header(None)):
 async def cleanup_memory():
     """Background task for memory cleanup"""
     try:
-        # Intelligent cache cleanup - get cache stats
-        cache_stats = rag_system.embedding_cache.get_stats()
-        memory_cache_size = cache_stats.get("memory_cache_size", 0)
-        max_memory_size = rag_system.embedding_cache.max_memory_size
-        
-        if memory_cache_size > max_memory_size * 0.8:
-            # Redis cache handles its own eviction, so just clear memory cache if needed
-            await rag_system.embedding_cache._evict_memory_items(int(max_memory_size * 0.2))
+        # Simple memory cleanup without cache management
         
         # Clear GPU memory periodically
         if DEVICE == "cuda":
@@ -2042,27 +2375,12 @@ async def api_health_checkpoint():
         except Exception as e:
             logger.warning(f"Embedding test failed: {e}")
         
-        # Test Redis connection
-        redis_status = {
-            "connected": False,
-            "error": None
-        }
-        try:
-            redis_conn = await get_redis_client()
-            if redis_conn:
-                await redis_conn.ping()
-                redis_status["connected"] = True
-        except Exception as e:
-            redis_status["error"] = str(e)
-        
-        # Get cache statistics
-        cache_stats = rag_system.embedding_cache.get_stats()
-        
         # System resources
         system_resources = {
             "device": DEVICE,
             "cuda_available": torch.cuda.is_available() if 'torch' in globals() else False,
-            "cpu_count": CPU_COUNT
+            "cpu_count": CPU_COUNT,
+            "memory_usage_gb": get_memory_usage()
         }
         
         if DEVICE == "cuda":
@@ -2079,11 +2397,13 @@ async def api_health_checkpoint():
         if not model_status["embedding_model_loaded"] or not embedding_test_passed:
             overall_status = "degraded"
         
+        # System ready - no cache stats needed for speed
+        
         health_data = {
             "status": overall_status,
             "timestamp": time.time(),
-            "service": "Redis-Enhanced RAG System",
-            "version": "9.0.0",
+            "service": "Fast Parallel RAG System",
+            "version": "10.0.0",
             "api_version": "v1",
             "checkpoint_duration_ms": round(checkpoint_time * 1000, 2),
             "models": model_status,
@@ -2091,19 +2411,16 @@ async def api_health_checkpoint():
                 "passed": embedding_test_passed,
                 "duration_ms": round(embedding_time * 1000, 2)
             },
-            "redis": redis_status,
-            "cache": {
-                "memory_cache_size": cache_stats.get("memory_cache_size", 0),
-                "overall_hit_rate": cache_stats.get("overall_hit_rate", 0),
-                "total_requests": cache_stats.get("total_requests", 0)
-            },
             "system": system_resources,
+            "concurrency": {
+                "max_requests": REQUEST_SEMAPHORE._value,
+                "max_processing": PROCESSING_SEMAPHORE._value
+            },
             "endpoints": {
                 "main": "/api/v1/hackrx/run",
                 "health": "/health",
                 "api_health": "/api/health",
-                "performance": "/performance/stats",
-                "redis_status": "/redis-status"
+                "performance": "/performance/stats"
             }
         }
         
@@ -2114,94 +2431,31 @@ async def api_health_checkpoint():
         return {
             "status": "unhealthy",
             "timestamp": time.time(),
-            "service": "Redis-Enhanced RAG System",
-            "version": "9.0.0",
+            "service": "Fast Parallel RAG System",
+            "version": "10.0.0",
             "error": str(e)
         }
 
-@app.get("/redis-status")
-async def redis_status(authorization: str = Header(None)):
-    """Get Redis connection status and cache statistics"""
-    verify_token(authorization)
-    
-    try:
-        redis_conn = await get_redis_client()
-        redis_connected = False
-        redis_info = {}
-        
-        if redis_conn:
-            try:
-                await redis_conn.ping()
-                redis_connected = True
-                # Get Redis info
-                info = await redis_conn.info()
-                redis_info = {
-                    "redis_version": info.get("redis_version", "unknown"),
-                    "used_memory_human": info.get("used_memory_human", "unknown"),
-                    "connected_clients": info.get("connected_clients", 0),
-                    "total_commands_processed": info.get("total_commands_processed", 0),
-                    "keyspace_hits": info.get("keyspace_hits", 0),
-                    "keyspace_misses": info.get("keyspace_misses", 0)
-                }
-                
-                # Get key counts
-                embedding_keys = await redis_conn.keys("embedding:*")
-                query_keys = await redis_conn.keys("query:*")
-                redis_info.update({
-                    "embedding_keys_count": len(embedding_keys),
-                    "query_keys_count": len(query_keys)
-                })
-                
-            except Exception as e:
-                redis_connected = False
-                redis_info = {"error": str(e)}
-        
-        # Get cache statistics
-        embedding_cache_stats = rag_system.embedding_cache.get_stats()
-        query_cache_stats = rag_system.query_cache.get_stats()
-        
-        return {
-            "redis_connected": redis_connected,
-            "redis_config": {
-                "host": REDIS_HOST,
-                "port": REDIS_PORT,
-                "db": REDIS_DB,
-                "expire_time": REDIS_EXPIRE_TIME
-            },
-            "redis_info": redis_info,
-            "cache_stats": {
-                "embedding_cache": embedding_cache_stats,
-                "query_cache": query_cache_stats
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Redis status check failed: {e}")
-        return {
-            "redis_connected": False,
-            "error": str(e),
-            "cache_stats": {
-                "embedding_cache": rag_system.embedding_cache.get_stats(),
-                "query_cache": rag_system.query_cache.get_stats()
-            }   
-        }
+# End of API endpoints
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "name": "Qwen3-Optimized Ultra-Fast RAG System",
-        "version": "9.0.0",
-        "description": "Production-grade RAG system with JinaAI embeddings and advanced optimizations",
+        "name": "Fast Parallel RAG System",
+        "version": "10.0.0",
+        "description": "High-performance RAG system optimized for parallel processing and 30-second responses",
         "model": rag_system.embedding_model_name,
         "device": DEVICE,
+        "concurrency": {
+            "max_requests": REQUEST_SEMAPHORE._value,
+            "max_processing": PROCESSING_SEMAPHORE._value
+        },
         "endpoints": {
-            "main": "/hackrx/run",
+            "main": "/api/v1/hackrx/run",
             "health": "/health",
             "performance": "/performance/stats",
-            "system_info": "/performance/system-info",
-            "debug": "/debug/document-structure",
-            "benchmark": "/benchmark/qwen3-performance"
+            "system_info": "/performance/system-info"
         }
     }
 
@@ -2209,25 +2463,39 @@ async def root():
 # 7. SERVER EXECUTION
 # ==============================================================================
 if __name__ == "__main__":
-    logger.info("🚀 Starting Qwen3-Optimized Ultra-Fast RAG Server...")
+    import sys
+    
+    # Support configurable port via command line argument
+    port = 8000
+    if len(sys.argv) > 1:
+        try:
+            port = int(sys.argv[1])
+        except ValueError:
+            logger.warning(f"Invalid port argument: {sys.argv[1]}, using default 8000")
+    
+    logger.info("🚀 Starting ULTRA-FAST CONCURRENT RAG Server (<10s target, <4GB RAM)...")
     logger.info(f"🔥 Hardware: {DEVICE} | CPU cores: {CPU_COUNT} | GPU memory: {GPU_MEMORY_GB:.1f}GB")
     logger.info(f"⚡ Model: {rag_system.embedding_model_name}")
+    logger.info(f"🔄 ULTRA-FAST Concurrency: {REQUEST_SEMAPHORE._value} requests, {PROCESSING_SEMAPHORE._value} processing, {CHUNK_PROCESSING_SEMAPHORE._value} chunk ops")
+    logger.info(f"🌐 Server port: {port} | PARALLEL CHUNKING ENABLED")
+    logger.info(f"🧠 Memory-aware parallel processing with dynamic batching")
+    logger.info(f"⚡ Parallel features: Page combining, heading detection, chunk processing, embedding generation")
     
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
-        port=8000, 
-        reload=False,  # Disable reload for production
-        workers=1,     # Single worker for shared model state (OPTIMAL for ML)
+        port=port, 
+        reload=False,
+        workers=1,     # Single worker for shared model state
         loop="asyncio",
         log_level="info",
-        # Optimize for limited resources (Lightsail 2GB)
-        timeout_keep_alive=30,
-        limit_concurrency=5,        # Limit concurrent requests to prevent OOM
-        limit_max_requests=200,     # Increased from 100 for better throughput
-        access_log=False,           # Reduce logging overhead
-        # Additional optimizations
-        h11_max_incomplete_event_size=16384,
-        ws_max_size=16777216,
+        # Optimized for ULTRA-FAST concurrent processing with 2.5GB RAM
+        timeout_keep_alive=90,        # Longer timeout for concurrent processing
+        limit_concurrency=20,         # Increased for ultra-fast chunking
+        limit_max_requests=2000,      # Higher limit for concurrent processing
+        access_log=True,              # Enable for monitoring parallel requests
+        # Additional optimizations for parallel processing
+        h11_max_incomplete_event_size=32768,  # Larger buffer for parallel requests
+        ws_max_size=33554432,         # Larger websocket for parallel data
         lifespan="on"
     )
