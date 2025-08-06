@@ -21,15 +21,15 @@ RUN pip install --no-cache-dir --upgrade pip && \
     # Remove any existing problematic packages
     pip uninstall torch transformers sentence-transformers numpy scipy huggingface-hub -y || true && \
     # Install numpy first (critical for other dependencies) - FIXED VERSION
-    pip install --no-cache-dir numpy==1.21.6 && \
+    pip install --no-cache-dir numpy==1.23.5 && \
     # Install scipy with compatible version
     pip install --no-cache-dir scipy==1.9.3 && \
     # Install huggingface-hub (required by sentence-transformers)
     pip install --no-cache-dir huggingface-hub==0.16.4 && \
     # Install PyTorch 2.0.1 CPU version with proper URL
-    pip install --no-cache-dir torch==2.0.1+cpu --find-links https://download.pytorch.org/whl/torch_stable.html && \
+    pip install --no-cache-dir torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu && \
     # Install transformers (compatible version)
-    pip install --no-cache-dir transformers==4.21.3 && \
+    pip install --no-cache-dir transformers==4.30.2 && \
     # Install tokenizers and safetensors
     pip install --no-cache-dir tokenizers==0.13.3 && \
     pip install --no-cache-dir safetensors==0.3.1 && \
@@ -41,12 +41,18 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application code
 COPY . .
 
-# Create cache and model directories for BGE-base
+# Create cache and model directories for BGE-base with proper permissions
 RUN mkdir -p /app/cache /app/downloads /app/models /app/nltk_data && \
-    chown -R 1000:1000 /app/cache /app/downloads /app/models /app/nltk_data
+    chmod -R 755 /app && \
+    chown -R 1000:1000 /app
 
 # Create non-root user for security
-RUN useradd -m -u 1000 raguser && chown -R raguser:raguser /app
+RUN useradd -m -u 1000 raguser
+
+# Set proper permissions before switching user
+RUN chown -R raguser:raguser /app && \
+    chmod -R 755 /app/models /app/cache /app/downloads /app/nltk_data
+
 USER raguser
 
 # Download NLTK data and pre-cache models for accuracy

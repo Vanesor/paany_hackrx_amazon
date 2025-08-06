@@ -16,10 +16,15 @@ sudo docker-compose down 2>/dev/null || true
 echo "🧹 Cleaning up old containers..."
 sudo docker system prune -f
 
-# Create necessary directories
+# Create necessary directories with proper permissions
 echo "📁 Creating directories for BGE-base models..."
 mkdir -p cache downloads models auto_downloads
 chmod 755 cache downloads models auto_downloads
+
+# Set proper ownership if running as root
+if [ "$EUID" -eq 0 ]; then
+    chown -R 1000:1000 cache downloads models auto_downloads
+fi
 
 # Check if .env exists
 if [ ! -f .env ]; then
@@ -31,8 +36,8 @@ if [ ! -f .env ]; then
 fi
 
 # Build and start the accuracy system
-echo "🏗️  Building accuracy-optimized system..."
-sudo docker-compose build --no-cache
+echo "🏗️  Building accuracy-optimized system (this may take 5-10 minutes)..."
+sudo docker-compose build --no-cache --progress=plain
 
 echo "🚀 Starting accuracy system..."
 sudo docker-compose up -d
@@ -42,6 +47,14 @@ echo "⏳ Waiting for BGE-base models to load (this takes 2-3 minutes)..."
 for i in {1..36}; do
     echo -n "."
     sleep 5
+    
+    # Check if container is still running
+    if ! sudo docker ps | grep -q rag-accuracy-system; then
+        echo ""
+        echo "❌ Container stopped unexpectedly. Checking logs..."
+        sudo docker-compose logs rag-accuracy-system
+        exit 1
+    fi
 done
 echo ""
 
@@ -71,7 +84,11 @@ if curl -f http://localhost:8000/health > /dev/null 2>&1; then
     
 else
     echo "❌ System failed to start properly"
-    echo "Check logs: sudo docker-compose logs rag-accuracy-system"
+    echo "📋 Container logs:"
+    sudo docker-compose logs rag-accuracy-system
+    echo ""
+    echo "🔍 System status:"
+    sudo docker ps -a
     exit 1
 fi
 

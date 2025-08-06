@@ -33,7 +33,12 @@ import signal
 import numpy as np
 import google.generativeai as genai
 from sentence_transformers import SentenceTransformer
-from sentence_transformers.cross_encoder import CrossEncoder
+# Fix CrossEncoder import for compatibility
+try:
+    from sentence_transformers import CrossEncoder
+except ImportError:
+    # Fallback for older versions that have it in cross_encoder module
+    from sentence_transformers.cross_encoder import CrossEncoder
 import torch
 from transformers import AutoTokenizer
 
@@ -933,11 +938,17 @@ class LightweightRAGSystem:
             
             # Load BGE-base embedding model (better accuracy)
             logger.info(f"Loading BGE-base embedding model: {self.embedding_model_name}")
+            
+            # Create cache directory with proper permissions
+            import os
+            cache_dir = "/app/models"
+            os.makedirs(cache_dir, exist_ok=True)
+            
             self.embedding_model = SentenceTransformer(
                 self.embedding_model_name,
                 device="cpu",  # Force CPU
-                cache_folder="/tmp/sentence_transformers",
-            #    trust_remote_code=True  # Required for BGE models
+                cache_folder=cache_dir,
+                trust_remote_code=True  # Required for BGE models
             )
             
             # Disable gradient tracking for speed
@@ -952,10 +963,17 @@ class LightweightRAGSystem:
             
             # Load more accurate reranker (6-layer instead of 2-layer)
             logger.info(f"Loading accurate reranker: {self.reranker_model_name}")
+            
+            # Create cache directory with proper permissions
+            import os
+            cache_dir = "/app/models" 
+            os.makedirs(cache_dir, exist_ok=True)
+            
             self.reranker_model = CrossEncoder(
                 self.reranker_model_name,
                 device="cpu",
-                max_length=128  # Increased for better context understanding
+                max_length=128,  # Increased for better context understanding
+                cache_folder=cache_dir
             )
             
             # Disable gradients for reranker
