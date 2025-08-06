@@ -119,11 +119,11 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 if torch.cuda.is_available():
     # Get GPU memory info for optimization
     GPU_MEMORY_GB = torch.cuda.get_device_properties(0).total_memory / 1e9
-    logger.info(f"🔥 GPU detected: {torch.cuda.get_device_name(0)} ({GPU_MEMORY_GB:.1f}GB)")
+    logger.info(f"GPU detected: {torch.cuda.get_device_name(0)} ({GPU_MEMORY_GB:.1f}GB)")
 else:
     GPU_MEMORY_GB = 0
 
-logger.info(f"🔥 Using device: {DEVICE} | CPU cores: {CPU_COUNT}")
+logger.info(f"Using device: {DEVICE} | CPU cores: {CPU_COUNT}")
 
 
 # 2. ENHANCED DATA STRUCTURES FOR HIERARCHICAL CHUNKING
@@ -245,7 +245,7 @@ class HierarchicalSemanticProcessor:
         # Combine all pages with character mapping using PARALLEL processing
         full_text, char_to_page_map = self._combine_pages_parallel(pages)
         
-        logger.info(f"[{request_id}] 🔍 Analyzing document structure with PARALLEL processing...")
+        logger.info(f"[{request_id}] Analyzing document structure with PARALLEL processing...")
         
         # Create hash for caching analysis
         text_hash = hashlib.sha256(full_text[:10000].encode()).hexdigest()[:16]

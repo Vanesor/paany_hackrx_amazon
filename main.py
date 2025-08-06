@@ -119,7 +119,7 @@ def check_memory_threshold() -> bool:
 DEVICE = "cpu"  # Force CPU for memory efficiency
 GPU_MEMORY_GB = 0
 
-logger.info(f"🔥 Using device: {DEVICE} | CPU cores: {CPU_COUNT} (Memory-optimized for 1GB)")
+logger.info(f"Using device: {DEVICE} | CPU cores: {CPU_COUNT} (Memory-optimized for 1GB)")
 
 
 # 2. ENHANCED DATA STRUCTURES FOR HIERARCHICAL CHUNKING
@@ -270,7 +270,7 @@ class HierarchicalSemanticProcessor:
         # Combine all pages with character mapping using PARALLEL processing
         full_text, char_to_page_map = self._combine_pages_parallel(pages)
         
-        logger.info(f"[{request_id}] 🔍 Analyzing document structure with PARALLEL processing...")
+        logger.info(f"[{request_id}] Analyzing document structure with PARALLEL processing...")
         
         # Create hash for caching analysis
         text_hash = hashlib.sha256(full_text[:10000].encode()).hexdigest()[:16]
@@ -796,7 +796,7 @@ class HierarchicalSemanticProcessor:
         ]
         
         if not elements_to_chunk:
-            logger.info(f"[{request_id}] ⚡ No elements need chunking - skipping parallel processing")
+            logger.info(f"[{request_id}] No elements need chunking - skipping parallel processing")
             return
         
         logger.info(f"[{request_id}] 🔄 Processing {len(elements_to_chunk)} elements in parallel...")
@@ -883,7 +883,7 @@ class LightweightRAGSystem:
         # ACCURACY-OPTIMIZED models for 2GB RAM - better quality answers
         self.embedding_model_name = 'BAAI/bge-base-en-v1.5'  # Better model (~440MB) for higher accuracy
         self.reranker_model_name = 'cross-encoder/ms-marco-MiniLM-L-6-v2'  # More accurate reranker (6 layers)
-        self.llm_model = genai.GenerativeModel('gemini-1.5-flash',
+        self.llm_model = genai.GenerativeModel('gemini-2.5-flash-lite',
             generation_config={
                 'temperature': 0.05,  # Lower temperature for more accurate responses
                 'top_p': 0.7,         # More focused sampling
@@ -948,7 +948,7 @@ class LightweightRAGSystem:
                 self.embedding_model_name,
                 device="cpu",  # Force CPU
                 cache_folder=cache_dir,
-                trust_remote_code=True  # Required for BGE models
+                #trust_remote_code=True  # Required for BGE models
             )
             
             # Disable gradient tracking for speed
@@ -984,7 +984,7 @@ class LightweightRAGSystem:
                 param.requires_grad = False
             
             # Minimal warmup for BGE-base (accuracy focused)
-            logger.info("🔥 Quick warmup for BGE-base model...")
+            logger.info("Quick warmup for BGE-base model...")
             with torch.no_grad():
                 _ = self.embedding_model.encode(
                     ["Test"],
@@ -1002,10 +1002,10 @@ class LightweightRAGSystem:
             gc.collect()
             
             logger.info(f"✅ BGE-base models loaded for ACCURACY | Max batch size: {self.max_batch_size}")
-            logger.info(f"💾 Memory usage after loading: {get_memory_usage():.2f}GB")
+            logger.info(f"Memory usage after loading: {get_memory_usage():.2f}GB")
             
         except Exception as e:
-            logger.error(f"❌ Model loading failed: {e}")
+            logger.error(f"Model loading failed: {e}")
             raise
 
     async def download_and_extract(self, pdf_url: str) -> List[Tuple[int, str]]:
@@ -1042,12 +1042,12 @@ class LightweightRAGSystem:
             gc.collect()
             
             download_time = time.time() - start_time
-            logger.info(f"📄 PDF extracted: {len(pages)} pages in {download_time:.2f}s")
+            logger.info(f"PDF extracted: {len(pages)} pages in {download_time:.2f}s")
             
             return pages
             
         except Exception as e:
-            logger.error(f"❌ PDF processing failed: {e}")
+            logger.error(f"PDF processing failed: {e}")
             raise HTTPException(status_code=500, detail=f"PDF processing error: {str(e)}")
 
     async def _embed_texts_lightweight(self, texts: List[str]) -> np.ndarray:
@@ -1095,7 +1095,7 @@ class LightweightRAGSystem:
             return embeddings
             
         except Exception as e:
-            logger.error(f"❌ Embedding generation failed: {e}")
+            logger.error(f"Embedding generation failed: {e}")
             return np.zeros((len(texts), 768))  # BGE-base dimension
 
     def _rerank_minimal(self, query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1128,7 +1128,7 @@ class LightweightRAGSystem:
             return sorted(chunks, key=lambda x: x['rerank_score'], reverse=True)
             
         except Exception as e:
-            logger.error(f"❌ Reranking error: {e}")
+            logger.error(f"Reranking error: {e}")
             # Fallback to similarity scores
             for chunk in chunks:
                 chunk['rerank_score'] = chunk.get('semantic_score', 0.0)
@@ -1142,7 +1142,7 @@ class LightweightRAGSystem:
         
         # Check timeout before starting
         if timeout_manager.is_timeout_exceeded():
-            logger.warning(f"[{request_id}] ⏰ Timeout exceeded before retrieval")
+            logger.warning(f"[{request_id}] Timeout exceeded before retrieval")
             return []
         
         if len(chunks_with_metadata) == 0:
@@ -1189,7 +1189,7 @@ class LightweightRAGSystem:
         
         # Check timeout before reranking
         if timeout_manager.is_timeout_approaching():
-            logger.warning(f"[{request_id}] ⏰ Timeout approaching, skipping reranking")
+            logger.warning(f"[{request_id}] Timeout approaching, skipping reranking")
             candidate_chunks.sort(key=lambda x: x['semantic_score'], reverse=True)
             final_chunks = candidate_chunks[:self.top_k_final]
             for chunk in final_chunks:
@@ -1207,8 +1207,8 @@ class LightweightRAGSystem:
         
         # Check timeout before answering
         if timeout_manager.is_timeout_exceeded():
-            logger.warning(f"[{request_id}] ⏰ Timeout exceeded, returning partial answer")
-            return "⏰ Response timeout reached. Please try again with a simpler query."
+            logger.warning(f"[{request_id}] Timeout exceeded, returning partial answer")
+            return "Response timeout reached. Please try again with a simpler query."
         
         if not contexts:
             return "I couldn't find relevant information to answer your question."
@@ -1242,7 +1242,7 @@ COMPREHENSIVE ANSWER:"""
         try:
             # Check timeout one more time
             if timeout_manager.is_timeout_approaching():
-                logger.warning(f"[{request_id}] ⏰ Timeout approaching during answer generation")
+                logger.warning(f"[{request_id}] Timeout approaching during answer generation")
                 return f"{contexts[0]['text'][:200]}..."
             
             # Generate answer with more time for comprehensive responses
@@ -1254,10 +1254,10 @@ COMPREHENSIVE ANSWER:"""
             return response.text.strip()
             
         except asyncio.TimeoutError:
-            logger.warning(f"[{request_id}] ⏰ Answer generation timeout")
+            logger.warning(f"[{request_id}] Answer generation timeout")
             return f"{contexts[0]['text'][:200]}..."
         except Exception as e:
-            logger.error(f"[{request_id}] ❌ Answer generation failed: {e}")
+            logger.error(f"[{request_id}] Answer generation failed: {e}")
             return f"I encountered an error while processing your question: {str(e)}"
 
     async def _generate_answer_async(self, prompt: str):
@@ -1272,27 +1272,17 @@ COMPREHENSIVE ANSWER:"""
             "memory_cleanups": self.performance_stats['memory_cleanups'],
             "current_memory_gb": get_memory_usage()
         }
-        
-        # Warmup reranker
-        _ = self.reranker_model.predict([["warmup query", "warmup text"]], show_progress_bar=False)
-        
-        # Force garbage collection after model loading
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
-        
-        logger.info(f"--- JinaAI Models loaded successfully | Max batch size: {self.max_batch_size} ---")
 
     def _extract_pdf_text(self, content: bytes) -> List[Tuple[int, str]]:
         """Memory-optimized PDF text extraction for heavy files under 1.7GB RAM"""
         pages = []
         initial_memory = get_memory_usage()
-        logger.info(f"📄 Starting PDF extraction | Memory: {initial_memory:.2f}GB")
+        logger.info(f"Starting PDF extraction | Memory: {initial_memory:.2f}GB")
         
         try:
             with fitz.open(stream=content, filetype="pdf") as doc:
                 total_pages = len(doc)
-                logger.info(f"📄 Processing {total_pages} pages")
+                logger.info(f"Processing {total_pages} pages")
                 
                 # For heavy files, process in larger batches with memory cleanup
                 if total_pages > 20 or len(content) > 20_000_000:  # Heavy file detection
@@ -1319,7 +1309,7 @@ COMPREHENSIVE ANSWER:"""
                             logger.warning(f"⚠️ High memory usage: {current_memory:.2f}GB - forcing cleanup")
                             force_memory_cleanup()
                         
-                        logger.info(f"📄 Processed batch {batch_start+1}-{batch_end} | Memory: {current_memory:.2f}GB")
+                        logger.info(f"Processed batch {batch_start+1}-{batch_end} | Memory: {current_memory:.2f}GB")
                 else:
                     # Normal processing for smaller files
                     for page_num, page in enumerate(doc):
@@ -1331,14 +1321,14 @@ COMPREHENSIVE ANSWER:"""
                             logger.warning(f"Error extracting page {page_num + 1}: {e}")
         
         except Exception as e:
-            logger.error(f"❌ PDF extraction failed: {e}")
+            logger.error(f"PDF extraction failed: {e}")
             return []
         
         finally:
             # Final cleanup
             gc.collect()
             final_memory = get_memory_usage()
-            logger.info(f"📄 PDF extraction complete: {len(pages)} pages | Memory: {final_memory:.2f}GB")
+            logger.info(f"PDF extraction complete: {len(pages)} pages | Memory: {final_memory:.2f}GB")
         
         return sorted(pages, key=lambda x: x[0])
 
@@ -1417,7 +1407,7 @@ COMPREHENSIVE ANSWER:"""
         
         # Memory monitoring with relaxed thresholds for speed
         current_memory = get_memory_usage()
-        logger.info(f"💾 Memory before embedding: {current_memory:.2f}GB")
+        logger.info(f"Memory before embedding: {current_memory:.2f}GB")
         
         # Early cleanup if memory is very high (increased threshold)
         if current_memory > 3.0:
@@ -1432,7 +1422,7 @@ COMPREHENSIVE ANSWER:"""
             cleaned = ' '.join(text.strip().split())[:512]  # Increased from 128 to 512
             processed_texts.append(cleaned)
         
-        logger.info(f"⚡ Processing {len(processed_texts)} texts with ULTRA-FAST concurrent settings")
+        logger.info(f"Processing {len(processed_texts)} texts with ULTRA-FAST concurrent settings")
         
         # Generate embeddings with CONCURRENT processing
         try:
@@ -1444,12 +1434,12 @@ COMPREHENSIVE ANSWER:"""
                 
                 embedding_time = time.time() - start_time
                 final_memory = get_memory_usage()
-                logger.info(f"⚡ CONCURRENT embedding complete: {embedding_time:.3f}s | Memory: {final_memory:.2f}GB")
+                logger.info(f"CONCURRENT embedding complete: {embedding_time:.3f}s | Memory: {final_memory:.2f}GB")
                 
                 return embeddings
                 
         except Exception as e:
-            logger.error(f"❌ Embedding generation failed: {e}")
+            logger.error(f"Embedding generation failed: {e}")
             return np.zeros((len(texts), 768))  # BGE-base dimension
 
     async def _generate_embeddings_batch_parallel(self, texts: List[str], batch_size: int = 16) -> np.ndarray:
@@ -1501,7 +1491,7 @@ COMPREHENSIVE ANSWER:"""
             return embeddings
             
         except Exception as e:
-            logger.error(f"❌ Parallel embedding batch failed: {e}")
+            logger.error(f"Parallel embedding batch failed: {e}")
             return np.zeros((len(texts), 768))  # BGE-base dimension
 
     async def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
@@ -1521,7 +1511,7 @@ COMPREHENSIVE ANSWER:"""
             )
             return embeddings
         except Exception as e:
-            logger.error(f"🔥 Batch embedding error: {e}")
+            logger.error(f"Batch embedding error: {e}")
             # Return zero embeddings as fallback
             return np.zeros((len(texts), 768))  # BGE-base dimension
 
@@ -1583,7 +1573,7 @@ COMPREHENSIVE ANSWER:"""
             return sorted(chunks, key=lambda x: x['rerank_score'], reverse=True)
             
         except Exception as e:
-            logger.error(f"❌ Heavy file reranking error: {e}")
+            logger.error(f"Heavy file reranking error: {e}")
             # Force cleanup on error
             force_memory_cleanup()
             # Fallback: return chunks with similarity scores as rerank scores
@@ -1603,7 +1593,7 @@ COMPREHENSIVE ANSWER:"""
         embed_start = time.time()
         query_embedding = await self._embed_with_advanced_caching([query])
         embed_time = time.time() - embed_start
-        logger.info(f"[{request_id}] ⚡ Query embedding: {embed_time:.3f}s")
+        logger.info(f"[{request_id}] Query embedding: {embed_time:.3f}s")
         
         if query_embedding.size == 0:
             return []
@@ -1635,7 +1625,7 @@ COMPREHENSIVE ANSWER:"""
             similarities = np.dot(chunk_embeddings, query_embedding)
         
         sim_time = time.time() - sim_start
-        logger.info(f"[{request_id}] ⚡ Similarity computation: {sim_time:.3f}s")
+        logger.info(f"[{request_id}] Similarity computation: {sim_time:.3f}s")
         
         # Advanced candidate selection
         select_start = time.time()
@@ -1661,7 +1651,7 @@ COMPREHENSIVE ANSWER:"""
             chunk['semantic_score'] = base_score + level_boost + content_boost + page_boost
         
         select_time = time.time() - select_start
-        logger.info(f"[{request_id}] ⚡ Candidate selection: {select_time:.3f}s")
+        logger.info(f"[{request_id}] Candidate selection: {select_time:.3f}s")
         
         # Smart selective reranking for accuracy
         rerank_start = time.time()
@@ -1669,14 +1659,14 @@ COMPREHENSIVE ANSWER:"""
         
         if top_score < self.rerank_threshold:
             # Low confidence - use reranking for accuracy
-            logger.info(f"[{request_id}] 🎯 Low confidence ({top_score:.3f}), applying reranking")
+            logger.info(f"[{request_id}] Low confidence ({top_score:.3f}), applying reranking")
             reranked_chunks = await asyncio.get_event_loop().run_in_executor(
                 None, self._rerank_with_optimization, query, candidate_chunks
             )
             final_chunks = reranked_chunks[:self.top_k_final]
         else:
             # High confidence - skip reranking for speed
-            logger.info(f"[{request_id}] 🚀 High confidence ({top_score:.3f}), skipping reranking")
+            logger.info(f"[{request_id}] High confidence ({top_score:.3f}), skipping reranking")
             candidate_chunks.sort(key=lambda x: x['semantic_score'], reverse=True)
             final_chunks = candidate_chunks[:self.top_k_final]
             
@@ -1685,11 +1675,11 @@ COMPREHENSIVE ANSWER:"""
                 chunk['rerank_score'] = chunk['semantic_score']
         
         rerank_time = time.time() - rerank_start
-        logger.info(f"[{request_id}] ⚡ Reranking: {rerank_time:.3f}s")
+        logger.info(f"[{request_id}] Reranking: {rerank_time:.3f}s")
         
         total_time = time.time() - start_time
         top_final_score = final_chunks[0]['rerank_score'] if final_chunks else 0
-        logger.info(f"[{request_id}] 🎯 Retrieval complete: {total_time:.3f}s | Top score: {top_final_score:.4f}")
+        logger.info(f"[{request_id}] Retrieval complete: {total_time:.3f}s | Top score: {top_final_score:.4f}")
         
         return final_chunks
 
@@ -2041,7 +2031,7 @@ async def cleanup_memory():
 async def lifespan(app: FastAPI):
     """Modern FastAPI lifespan management"""
     # Startup
-    logger.info("🚀 Starting BGE-base RAG Server for 2GB RAM...")
+    logger.info("Starting BGE-base RAG Server for 2GB RAM...")
     await asyncio.get_event_loop().run_in_executor(global_executor, rag_system.load_models)
     logger.info("✅ Server ready for requests")
     
@@ -2106,7 +2096,7 @@ async def process_document_and_answer(
     
     # Early memory check - reject if already too high for 2GB systems
     if initial_memory > 1.6:
-        logger.error(f"[{request_id}] ❌ Memory too high ({initial_memory:.2f}GB) - rejecting request")
+        logger.error(f"[{request_id}] Memory too high ({initial_memory:.2f}GB) - rejecting request")
         raise HTTPException(status_code=503, detail=f"Server memory too high: {initial_memory:.2f}GB")
     
     # SINGLE REQUEST processing optimized for 2GB RAM
@@ -2116,8 +2106,8 @@ async def process_document_and_answer(
         try:
             # Check initial timeout
             if timeout_manager.is_timeout_exceeded():
-                logger.error(f"[{request_id}] ⏰ Initial timeout exceeded")
-                return QueryResponse(answers=["⏰ Request timeout before processing started."])
+                logger.error(f"[{request_id}] Initial timeout exceeded")
+                return QueryResponse(answers=["Request timeout before processing started."])
             
             # Memory check for 2GB system
             current_memory = get_memory_usage()
@@ -2134,18 +2124,18 @@ async def process_document_and_answer(
             logger.info(f"[{request_id}] � Starting PDF extraction...")
             
             if timeout_manager.is_timeout_approaching():
-                logger.warning(f"[{request_id}] ⏰ Timeout approaching before PDF extraction")
-                return QueryResponse(answers=["⏰ Timeout approaching. Please try with a smaller document."])
+                logger.warning(f"[{request_id}] Timeout approaching before PDF extraction")
+                return QueryResponse(answers=["Timeout approaching. Please try with a smaller document."])
             
             pages = await rag_system.download_and_extract(request.documents)
             pdf_time = time.time() - pdf_start
             pdf_memory = get_memory_usage()
-            logger.info(f"[{request_id}] 📄 PDF extraction: {len(pages)} pages in {pdf_time:.3f}s | Memory: {pdf_memory:.2f}GB")
+            logger.info(f"[{request_id}] PDF extraction: {len(pages)} pages in {pdf_time:.3f}s | Memory: {pdf_memory:.2f}GB")
             
             # Check timeout after PDF extraction
             if timeout_manager.is_timeout_approaching():
-                logger.warning(f"[{request_id}] ⏰ Timeout approaching after PDF extraction")
-                return QueryResponse(answers=["⏰ Timeout reached during document processing. Please try with a smaller document."])
+                logger.warning(f"[{request_id}] Timeout approaching after PDF extraction")
+                return QueryResponse(answers=["Timeout reached during document processing. Please try with a smaller document."])
             
             # Memory cleanup for 2GB system
             if pdf_memory > 1.4:
@@ -2158,8 +2148,8 @@ async def process_document_and_answer(
             logger.info(f"[{request_id}] 🏗️ Starting structure analysis...")
             
             if timeout_manager.is_timeout_approaching():
-                logger.warning(f"[{request_id}] ⏰ Timeout approaching before structure analysis")
-                return QueryResponse(answers=["⏰ Timeout reached. Partial processing completed."])
+                logger.warning(f"[{request_id}] Timeout approaching before structure analysis")
+                return QueryResponse(answers=["Timeout reached. Partial processing completed."])
             
             hierarchical_elements = rag_system.processor.extract_hierarchical_structure(pages, request_id)
             
@@ -2173,8 +2163,8 @@ async def process_document_and_answer(
             
             # Check timeout after structure analysis
             if timeout_manager.is_timeout_approaching():
-                logger.warning(f"[{request_id}] ⏰ Timeout approaching after structure analysis")
-                return QueryResponse(answers=["⏰ Timeout reached during document analysis."])
+                logger.warning(f"[{request_id}] Timeout approaching after structure analysis")
+                return QueryResponse(answers=["Timeout reached during document analysis."])
             
             # Memory cleanup for 2GB system
             if structure_memory > 1.4:
@@ -2186,8 +2176,8 @@ async def process_document_and_answer(
             logger.info(f"[{request_id}] 📚 Creating retrieval chunks...")
             
             if timeout_manager.is_timeout_approaching():
-                logger.warning(f"[{request_id}] ⏰ Timeout approaching before chunking")
-                return QueryResponse(answers=["⏰ Timeout reached during document preparation."])
+                logger.warning(f"[{request_id}] Timeout approaching before chunking")
+                return QueryResponse(answers=["Timeout reached during document preparation."])
             
             chunks_with_metadata = rag_system.processor.get_chunks_for_retrieval(hierarchical_elements)
             
@@ -2201,8 +2191,8 @@ async def process_document_and_answer(
             
             # Check timeout before embedding
             if timeout_manager.is_timeout_approaching():
-                logger.warning(f"[{request_id}] ⏰ Timeout approaching before embedding")
-                return QueryResponse(answers=["⏰ Timeout reached during chunk preparation."])
+                logger.warning(f"[{request_id}] Timeout approaching before embedding")
+                return QueryResponse(answers=["Timeout reached during chunk preparation."])
             
             # Memory check before embedding for 2GB system
             if chunk_memory > 1.4:
@@ -2215,8 +2205,8 @@ async def process_document_and_answer(
             logger.info(f"[{request_id}] 🔢 Generating embeddings for {len(chunk_texts)} texts...")
             
             if timeout_manager.is_timeout_approaching():
-                logger.warning(f"[{request_id}] ⏰ Timeout approaching before embedding")
-                return QueryResponse(answers=["⏰ Timeout reached before embedding generation."])
+                logger.warning(f"[{request_id}] Timeout approaching before embedding")
+                return QueryResponse(answers=["Timeout reached before embedding generation."])
             
             chunk_embeddings = await rag_system._embed_texts_lightweight(chunk_texts)
             embed_time = time.time() - embed_start
@@ -2228,7 +2218,7 @@ async def process_document_and_answer(
                 rag_system.performance_stats['memory_cleanups'] += 1
             
             processing_time = time.time() - pdf_start
-            logger.info(f"[{request_id}] ⚡ Document processing complete: {processing_time:.3f}s (PDF: {pdf_time:.3f}s, Structure: {structure_time:.3f}s, Chunks: {chunk_time:.3f}s, Embedding: {embed_time:.3f}s) | Memory: {embed_memory:.2f}GB")
+            logger.info(f"[{request_id}] Document processing complete: {processing_time:.3f}s (PDF: {pdf_time:.3f}s, Structure: {structure_time:.3f}s, Chunks: {chunk_time:.3f}s, Embedding: {embed_time:.3f}s) | Memory: {embed_memory:.2f}GB")
 
             # Process questions with timeout awareness
             answers = []
@@ -2238,12 +2228,12 @@ async def process_document_and_answer(
                 
                 # Check timeout before each question
                 if timeout_manager.is_timeout_exceeded():
-                    logger.warning(f"[{q_request_id}] ⏰ Timeout exceeded, adding timeout answer")
-                    timeout_manager.add_partial_result("⏰ Request timeout reached. Please try again with fewer questions.")
+                    logger.warning(f"[{q_request_id}] Timeout exceeded, adding timeout answer")
+                    timeout_manager.add_partial_result("Request timeout reached. Please try again with fewer questions.")
                     break
                 
                 if timeout_manager.is_timeout_approaching():
-                    logger.warning(f"[{q_request_id}] ⏰ Timeout approaching, processing with reduced context")
+                    logger.warning(f"[{q_request_id}] Timeout approaching, processing with reduced context")
                     # Use reduced processing for speed
                     contexts = await rag_system.retrieve_and_rerank_with_timeout(
                         question, chunks_with_metadata[:50], chunk_embeddings[:50], q_request_id, timeout_manager
@@ -2264,7 +2254,7 @@ async def process_document_and_answer(
                 
                 # Break if timeout exceeded
                 if timeout_manager.is_timeout_exceeded():
-                    logger.warning(f"[{request_id}] ⏰ Timeout exceeded after question {q_idx+1}")
+                    logger.warning(f"[{request_id}] Timeout exceeded after question {q_idx+1}")
                     break
             
             # If no answers were generated due to timeout, use partial results
@@ -2284,7 +2274,7 @@ async def process_document_and_answer(
             
             logger.info(f"[{request_id}] ✅ REQUEST COMPLETE (1GB RAM Optimized):")
             logger.info(f"[{request_id}]   📊 Total time: {total_time:.3f}s")
-            logger.info(f"[{request_id}]   📄 Document processing: {processing_time:.3f}s")
+            logger.info(f"[{request_id}]   Document processing: {processing_time:.3f}s")
             logger.info(f"[{request_id}]   🤖 Questions processed: {len(answers)}/{len(request.questions)}")
             logger.info(f"[{request_id}]   🧠 Memory: {initial_memory:.2f}GB → {final_memory:.2f}GB (Δ{memory_delta:+.2f}GB)")
             logger.info(f"[{request_id}]   🗑️ Memory cleanups: {rag_system.performance_stats.get('memory_cleanups', 0)}")
@@ -2298,10 +2288,10 @@ async def process_document_and_answer(
         
         except Exception as e:
             error_time = time.time() - start_time
-            logger.error(f"[{request_id}] ❌ Error after {error_time:.3f}s: {e}")
+            logger.error(f"[{request_id}] Error after {error_time:.3f}s: {e}")
             # Return timeout message if error occurred near timeout
             if timeout_manager.is_timeout_approaching() or timeout_manager.is_timeout_exceeded():
-                return QueryResponse(answers=[f"⏰ Request timeout: {str(e)}"])
+                return QueryResponse(answers=[f"Request timeout: {str(e)}"])
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
@@ -2468,7 +2458,7 @@ async def debug_document_structure(request: QueryRequest, authorization: str = H
         return structure_analysis
     
     except Exception as e:
-        logger.error(f"[{request_id}] ❌ Debug error: {e}", exc_info=True)
+        logger.error(f"[{request_id}] Debug error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
 
 
@@ -2528,7 +2518,7 @@ async def debug_embedding_analysis(
         return analysis
     
     except Exception as e:
-        logger.error(f"[{request_id}] ❌ Embedding analysis error: {e}", exc_info=True)
+        logger.error(f"[{request_id}] Embedding analysis error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Embedding analysis error: {str(e)}")
 
 
@@ -2788,13 +2778,13 @@ if __name__ == "__main__":
         except ValueError:
             logger.warning(f"Invalid port argument: {sys.argv[1]}, using default 8000")
     
-    logger.info("🚀 Starting Lightweight RAG Server (30s timeout, 1GB RAM optimized)...")
-    logger.info(f"🔥 Hardware: {DEVICE} | CPU cores: {CPU_COUNT} | Memory target: 1GB")
-    logger.info(f"⚡ Models: {rag_system.embedding_model_name} (lightweight)")
+    logger.info("Starting Lightweight RAG Server (30s timeout, 1GB RAM optimized)...")
+    logger.info(f"Hardware: {DEVICE} | CPU cores: {CPU_COUNT} | Memory target: 1GB")
+    logger.info(f"Models: {rag_system.embedding_model_name} (lightweight)")
     logger.info(f"🔄 Single Process Mode: {REQUEST_SEMAPHORE._value} concurrent request")
     logger.info(f"🌐 Server port: {port} | TIMEOUT-AWARE PROCESSING")
     logger.info(f"🧠 Memory-conservative processing with 30-second timeout")
-    logger.info(f"⏰ Features: Timeout management, partial results, 1GB RAM optimization")
+    logger.info(f"Features: Timeout management, partial results, 1GB RAM optimization")
     
     uvicorn.run(
         "main:app", 

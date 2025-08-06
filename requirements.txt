@@ -1,39 +1,38 @@
-# Core ML dependencies fixed for Python 3.10.12
-torch==2.0.1
-transformers==4.30.2
-sentence-transformers==2.2.2
-numpy==1.23.5  # Fixed version that works with both SciPy and torch
-
-# Hugging Face dependencies (fixed compatible versions)
-huggingface-hub==0.16.4
-safetensors==0.3.1
-tokenizers==0.13.3
+# Core dependencies for semantic chunking and BGE embeddings
+torch>=2.0.0
+transformers>=4.30.0
+sentence-transformers>=2.2.0
+numpy>=1.24.0
 
 # Document processing
-PyMuPDF==1.20.2
-requests==2.28.2
+PyMuPDF>=1.23.0
+python-docx>=0.8.11
+beautifulsoup4>=4.12.0
+requests>=2.31.0
 
-# FastAPI and server
-fastapi==0.95.2
-uvicorn==0.20.0
-pydantic==1.10.12
+# Enhanced RAG System dependencies (from final.py)
+google-generativeai>=0.3.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+aiohttp>=3.8.0
+pydantic>=2.0.0
 
-# Google Generative AI
-google-generativeai==0.3.2
+# Redis caching
+redis>=5.0.0
+asyncio-redis>=0.16.0
 
-# Essential utilities
-tqdm==4.64.1
-psutil==5.9.4
-python-dotenv==0.19.2
+# Text processing and utilities
+tqdm>=4.65.0
+tiktoken>=0.5.0
 
-# Text processing - fixed for Python 3.10
-nltk==3.7
-tiktoken==0.5.1
+# Optional: For benchmarking and analysis
+scikit-learn>=1.3.0
+pandas>=2.0.0
+nltk>=3.8.0
+python-dotenv>=1.0.0
+PyPDF2>=3.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
 
-# Async HTTP
-aiohttp==3.8.6
-
-# Scientific computing - fixed compatible versions
-scikit-learn==1.1.3
-scipy==1.9.3
-scipy==1.9.3
+# Optional: for advanced embeddings
+# cohere>=4.0.0   # Uncomment if you want to use Cohere embeddings
