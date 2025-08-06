@@ -937,7 +937,7 @@ class LightweightRAGSystem:
                 self.embedding_model_name,
                 device="cpu",  # Force CPU
                 cache_folder="/tmp/sentence_transformers",
-                trust_remote_code=True  # Required for BGE models
+            #    trust_remote_code=True  # Required for BGE models
             )
             
             # Disable gradient tracking for speed
