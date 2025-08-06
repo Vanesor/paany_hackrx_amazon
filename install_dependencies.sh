@@ -18,24 +18,34 @@ pip install --upgrade pip
 
 # Remove any existing problematic packages
 echo "🧹 Removing any existing problematic packages..."
-pip uninstall torch transformers sentence-transformers numpy scipy -y || true
+pip uninstall torch transformers sentence-transformers numpy scipy huggingface-hub -y || true
 
-# Install numpy first (critical for other dependencies)
-echo "📊 Installing numpy==1.23.5..."
-pip install --no-cache-dir numpy==1.23.5
-
-# Install PyTorch 2.0.1 (CPU version) to fix uint64 error
-echo "🔥 Installing PyTorch 2.0.1 (CPU version)..."
-pip install --no-cache-dir torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu
+# Install numpy first (critical for other dependencies) - FIXED VERSION for Python 3.10.12
+echo "📊 Installing numpy==1.21.6 (Python 3.10.12 compatible)..."
+pip install --no-cache-dir numpy==1.21.6
 
 # Install scipy with compatible version
 echo "🧮 Installing scipy==1.9.3..."
 pip install --no-cache-dir scipy==1.9.3
 
-# Install transformers and sentence-transformers
-echo "🤗 Installing transformers==4.30.2..."
-pip install --no-cache-dir transformers==4.30.2
+# Install huggingface-hub (required by sentence-transformers)
+echo "🤗 Installing huggingface-hub==0.16.4..."
+pip install --no-cache-dir huggingface-hub==0.16.4
 
+# Install PyTorch 2.0.1 CPU version with proper URL
+echo "🔥 Installing PyTorch 2.0.1+cpu..."
+pip install --no-cache-dir torch==2.0.1+cpu --find-links https://download.pytorch.org/whl/torch_stable.html
+
+# Install transformers (compatible version with numpy 1.21.6)
+echo "� Installing transformers==4.21.3..."
+pip install --no-cache-dir transformers==4.21.3
+
+# Install tokenizers and safetensors
+echo "🔤 Installing tokenizers and safetensors..."
+pip install --no-cache-dir tokenizers==0.13.3
+pip install --no-cache-dir safetensors==0.3.1
+
+# Install sentence-transformers
 echo "📝 Installing sentence-transformers==2.2.2..."
 pip install --no-cache-dir sentence-transformers==2.2.2
 

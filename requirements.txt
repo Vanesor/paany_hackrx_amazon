@@ -1,36 +1,38 @@
 # Core ML dependencies fixed for Python 3.10.12
-torch==2.0.1
-transformers==4.30.2
+torch==2.0.1+cpu --find-links https://download.pytorch.org/whl/torch_stable.html
+transformers==4.21.3
 sentence-transformers==2.2.2
-numpy==1.23.5  # Fixed version that works with both SciPy and torch
+numpy==1.21.6  # Fixed version for Python 3.10.12 compatibility
+
+# Hugging Face dependencies (critical for sentence-transformers)
+huggingface-hub==0.16.4
+safetensors==0.3.1
+tokenizers==0.13.3
 
 # Document processing
-PyMuPDF>=1.20.0
-requests>=2.28.0
+PyMuPDF==1.20.2
+requests==2.28.2
 
 # FastAPI and server
-fastapi>=0.95.0,<0.105.0
-uvicorn>=0.20.0,<0.24.0
-pydantic>=1.10.0,<2.0.0  # Stick to v1 for better compatibility
+fastapi==0.95.2
+uvicorn==0.20.0
+pydantic==1.10.12
 
 # Google Generative AI
 google-generativeai==0.3.2
 
 # Essential utilities
-tqdm>=4.64.0
-psutil>=5.9.0
-python-dotenv>=0.19.0
+tqdm==4.64.1
+psutil==5.9.4
+python-dotenv==0.19.2
 
 # Text processing - fixed for Python 3.10
 nltk==3.7
-tiktoken>=0.5.0
+tiktoken==0.5.1
 
 # Async HTTP
-aiohttp>=3.8.0,<3.9.0
+aiohttp==3.8.6
 
 # Scientific computing - fixed compatible versions
 scikit-learn==1.1.3
-scipy==1.9.3  # Compatible with numpy 1.23.5
-
-# Required for sentence-transformers
-safetensors==0.3.1
+scipy==1.9.3

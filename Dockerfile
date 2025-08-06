@@ -19,15 +19,21 @@ COPY requirements.txt .
 # Install Python dependencies with proper order for Python 3.10.12
 RUN pip install --no-cache-dir --upgrade pip && \
     # Remove any existing problematic packages
-    pip uninstall torch transformers sentence-transformers numpy scipy -y || true && \
-    # Install numpy first (critical for other dependencies)
-    pip install --no-cache-dir numpy==1.23.5 && \
-    # Install PyTorch 2.0.1 (CPU version) to fix uint64 error
-    pip install --no-cache-dir torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu && \
+    pip uninstall torch transformers sentence-transformers numpy scipy huggingface-hub -y || true && \
+    # Install numpy first (critical for other dependencies) - FIXED VERSION
+    pip install --no-cache-dir numpy==1.21.6 && \
     # Install scipy with compatible version
     pip install --no-cache-dir scipy==1.9.3 && \
-    # Install transformers and sentence-transformers
-    pip install --no-cache-dir transformers==4.30.2 && \
+    # Install huggingface-hub (required by sentence-transformers)
+    pip install --no-cache-dir huggingface-hub==0.16.4 && \
+    # Install PyTorch 2.0.1 CPU version with proper URL
+    pip install --no-cache-dir torch==2.0.1+cpu --find-links https://download.pytorch.org/whl/torch_stable.html && \
+    # Install transformers (compatible version)
+    pip install --no-cache-dir transformers==4.21.3 && \
+    # Install tokenizers and safetensors
+    pip install --no-cache-dir tokenizers==0.13.3 && \
+    pip install --no-cache-dir safetensors==0.3.1 && \
+    # Install sentence-transformers
     pip install --no-cache-dir sentence-transformers==2.2.2 && \
     # Install remaining dependencies
     pip install --no-cache-dir -r requirements.txt
