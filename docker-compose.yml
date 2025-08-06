@@ -1,53 +1,49 @@
 version: "3.8"
 
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: rag-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - ./redis.conf:/usr/local/etc/redis/redis.conf
-      - redis-data:/data
-    command: redis-server /usr/local/etc/redis/redis.conf
-    restart: unless-stopped
-    networks:
-      - rag-network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-
   rag-system:
     build: .
     container_name: rag-system
     ports:
       - "8000:8000"
     environment:
-      - REDIS_URL=redis://redis:6379
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_DB=0
-      - REDIS_EXPIRE_TIME=86400
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - CACHE_DIR=/app/cache
-      - NLTK_DATA=/app/nltk_data
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-your-api-key-here}
+      - API_TOKEN=${API_TOKEN:-your-secure-token-here}
       - PYTHONPATH=/app
+      - TRANSFORMERS_CACHE=/app/model_cache
+      - HF_HOME=/app/model_cache
+      - TOKENIZERS_PARALLELISM=false
+      - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - NUMEXPR_NUM_THREADS=2
     volumes:
-      - ./cache:/app/cache
-      - ./downloads:/app/downloads
-      - ./auto_downloads:/app/auto_downloads
-    depends_on:
-      redis:
-        condition: service_healthy
+      - model-cache:/app/model_cache
     networks:
       - rag-network
     restart: unless-stopped
-    # Resource limits for Lightsail 2GB optimization
+    # Resource limits optimized for 1.3GB RAM
     deploy:
       resources:
         limits:
+          memory: 1200M  # 1.2GB limit for 1.3GB available
+          cpus: '2.0'    # Limited CPU for stability
+        reservations:
+          memory: 800M   # Reserve 800MB
+          cpus: '1.0'    # Reserve 1 CPU
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s  # More time for model loading
+
+networks:
+  rag-network:
+    driver: bridge
+
+volumes:
+  model-cache:
+    driver: local
           memory: 1.5G
           cpus: '1.8'
         reservations:

@@ -31,8 +31,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import uvicorn
-import dotenv
-dotenv.load_dotenv()
+
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -62,18 +61,15 @@ CPU_COUNT = min(4, os.cpu_count() or 4)
 # Initialize Google Generative AI
 try:
     import google.generativeai as genai
-    # Configure with Gemini Flash (most accurate and fast)
+    # Configure with Gemini 2.0 Flash (most accurate and fast)
     genai.configure(api_key=os.getenv('GOOGLE_API_KEY', 'your-api-key-here'))
-    GEMINI_MODEL = 'gemini-1.5-flash'  # Stable and fast model
+    GEMINI_MODEL = 'gemini-2.0-flash-exp'  # Latest and most accurate
 except ImportError:
     logger.error("Google Generative AI not available")
     genai = None
 
 # Global executor for async operations
 global_executor = ThreadPoolExecutor(max_workers=2)  # Minimal threads for 1.3GB RAM
-
-# Single request processing lock
-processing_lock = asyncio.Lock()
 
 class TimeoutManager:
     """Manages request timeout and partial result handling"""
@@ -530,49 +526,41 @@ async def process_document_and_answer(
     """Main endpoint for document processing and question answering"""
     verify_token(authorization)
     
-    # Single request processing - check if system is busy
-    if processing_lock.locked():
-        raise HTTPException(
-            status_code=503, 
-            detail="System is currently processing another request. Please try again later."
-        )
+    request_id = f"req_{int(time.time() * 1000)}"
+    start_time = time.time()
+    initial_memory = get_memory_usage()
     
-    async with processing_lock:
-        request_id = f"req_{int(time.time() * 1000)}"
-        start_time = time.time()
-        initial_memory = get_memory_usage()
+    logger.info(f"[{request_id}] Starting request processing")
+    logger.info(f"[{request_id}] Questions: {len(request.questions)}")
+    logger.info(f"[{request_id}] Initial memory: {initial_memory:.2f}GB")
+    
+    # Memory check
+    if initial_memory > MAX_MEMORY_GB:
+        logger.error(f"[{request_id}] Memory too high: {initial_memory:.2f}GB")
+        raise HTTPException(status_code=503, detail="Server memory too high")
+    
+    try:
+        # Process document and questions
+        answers = await rag_system.process_document_and_questions(
+            request.documents, request.questions
+        )
         
-        logger.info(f"[{request_id}] Starting request processing")
-        logger.info(f"[{request_id}] Questions: {len(request.questions)}")
-        logger.info(f"[{request_id}] Initial memory: {initial_memory:.2f}GB")
+        # Performance logging
+        total_time = time.time() - start_time
+        final_memory = get_memory_usage()
         
-        # Memory check
-        if initial_memory > MAX_MEMORY_GB:
-            logger.error(f"[{request_id}] Memory too high: {initial_memory:.2f}GB")
-            raise HTTPException(status_code=503, detail="Server memory too high")
+        logger.info(f"[{request_id}] Request completed in {total_time:.2f}s")
+        logger.info(f"[{request_id}] Memory: {initial_memory:.2f}GB -> {final_memory:.2f}GB")
+        logger.info(f"[{request_id}] Answers returned: {len([a for a in answers if a])}")
         
-        try:
-            # Process document and questions
-            answers = await rag_system.process_document_and_questions(
-                request.documents, request.questions
-            )
-            
-            # Performance logging
-            total_time = time.time() - start_time
-            final_memory = get_memory_usage()
-            
-            logger.info(f"[{request_id}] Request completed in {total_time:.2f}s")
-            logger.info(f"[{request_id}] Memory: {initial_memory:.2f}GB -> {final_memory:.2f}GB")
-            logger.info(f"[{request_id}] Answers returned: {len([a for a in answers if a])}")
-            
-            # Cleanup
-            force_memory_cleanup()
-            
-            return QueryResponse(answers=answers)
-            
-        except Exception as e:
-            logger.error(f"[{request_id}] Request failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+        # Cleanup
+        force_memory_cleanup()
+        
+        return QueryResponse(answers=answers)
+        
+    except Exception as e:
+        logger.error(f"[{request_id}] Request failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 # Health check endpoint
 @app.get("/health")
@@ -582,19 +570,6 @@ async def health_check():
         "status": "healthy",
         "memory_usage_gb": get_memory_usage(),
         "memory_limit_gb": MAX_MEMORY_GB,
-        "model_loaded": rag_system.embedding_model is not None,
-        "system_busy": processing_lock.locked()
-    }
-
-# System status endpoint
-@app.get("/status")
-async def system_status():
-    """System status endpoint"""
-    return {
-        "system_busy": processing_lock.locked(),
-        "memory_usage_gb": get_memory_usage(),
-        "memory_limit_gb": MAX_MEMORY_GB,
-        "requests_processed": rag_system.performance_stats.get('requests_processed', 0),
         "model_loaded": rag_system.embedding_model is not None
     }
 
@@ -649,5 +624,7 @@ if __name__ == "__main__":
         loop="asyncio",
         log_level="info",
         timeout_keep_alive=45,
+        limit_concurrency=1,  # Single request processing
+        limit_max_requests=100,
         access_log=True
     )

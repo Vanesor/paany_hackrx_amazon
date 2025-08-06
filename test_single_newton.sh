@@ -3,9 +3,9 @@
 # Alternative Single Request Test - Newton's Principia
 # This tests with the physics document
 
-echo "🚀 Testing single request to RAG system..."
-echo "📄 Document: Newton's Principia PDF"
-echo "❓ Questions: 12 physics-related questions"
+echo "Testing single request to RAG system..."
+echo "Document: Newton's Principia PDF"
+echo "Questions: 12 physics-related questions"
 echo ""
 
 curl -X POST "http://localhost:8000/api/v1/hackrx/run" \
@@ -31,4 +31,4 @@ curl -X POST "http://localhost:8000/api/v1/hackrx/run" \
   }' | jq '.'
 
 echo ""
-echo "✅ Single request test completed"
+echo "Single request test completed"

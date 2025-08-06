@@ -3,22 +3,10 @@
 # Single Request Test - Policy Document
 # This tests a single request to your RAG system
 
-# echo "🚀 Testing single request to RAG system..."
-# echo "📄 Document: Policy PDF"
-# echo "❓ Questions: 10 policy-related questions"
-# echo "🌐 Using localhost server"
-# echo ""
-
-# curl -X POST "http://localhost:8000/api/v1/hackrx/run" \!/bin/bashcurl -X POST "http://localhost:8000/api/v1/hackrx/run" 
-#   -H "Content-Type: application/json" 
-#   -H "Accept: application/json" 
-#   -d '{Single Request Test - Policy Document
-# # This tests a single request to your RAG system
-
-echo "🚀 Testing single request to RAG system..."
-echo "📄 Document: Policy PDF"
-echo "❓ Questions: 10 policy-related questions"
-echo "🌐 Using localhost server"
+echo "Testing single request to RAG system..."
+echo "Document: Policy PDF"
+echo "Questions: 10 policy-related questions"
+echo "Using localhost server"
 echo ""
 
 curl -X POST "http://localhost:8000/api/v1/hackrx/run" \
@@ -42,4 +30,4 @@ curl -X POST "http://localhost:8000/api/v1/hackrx/run" \
   }' | jq '.'
 
 echo ""
-echo "✅ Single request test completed"
+echo "Single request test completed"

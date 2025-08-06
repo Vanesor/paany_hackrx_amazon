@@ -1,49 +1,58 @@
-# Use Python 3.10 slim image
+# Optimized Dockerfile for 1.3GB RAM Accuracy RAG System
 FROM python:3.10-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install minimal system dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     curl \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # Copy requirements first (for better Docker layer caching)
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies with optimizations for limited RAM
+RUN pip install --no-cache-dir --no-deps numpy==1.23.5 && \
+    pip install --no-cache-dir --no-deps torch==2.0.1 && \
+    pip install --no-cache-dir --no-deps huggingface-hub==0.16.4 && \
+    pip install --no-cache-dir --no-deps transformers==4.30.2 && \
+    pip install --no-cache-dir --no-deps sentence-transformers==2.2.2 && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
 
-# Create cache and data directories
-RUN mkdir -p /app/cache /app/downloads /app/nltk_data && \
-    chown -R 1000:1000 /app/cache /app/downloads /app/nltk_data
+# Create minimal cache directories
+RUN mkdir -p /app/model_cache && \
+    chown -R 1000:1000 /app
 
 # Create non-root user for security
 RUN useradd -m -u 1000 raguser && chown -R raguser:raguser /app
 USER raguser
 
-# Download NLTK data
-RUN python -c "import nltk; nltk.download('punkt', download_dir='/app/nltk_data'); nltk.download('stopwords', download_dir='/app/nltk_data')"
-
-# Set environment variables
-ENV NLTK_DATA=/app/nltk_data
+# Set environment variables for optimal performance
 ENV PYTHONPATH=/app
-ENV REDIS_URL=redis://redis:6379
-ENV CACHE_DIR=/app/cache
+ENV TRANSFORMERS_CACHE=/app/model_cache
+ENV HF_HOME=/app/model_cache
+ENV TOKENIZERS_PARALLELISM=false
+ENV OMP_NUM_THREADS=2
+ENV MKL_NUM_THREADS=2
+ENV NUMEXPR_NUM_THREADS=2
+
+# Set memory limits for Python
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
 # Expose port
 EXPOSE 8000
 
-# Health check - updated to use new API endpoint
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+# Health check for the optimized system
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--reload"]
+# Run with optimized settings for 1.3GB RAM
+CMD ["python", "-u", "main.py"]

@@ -1,11 +1,12 @@
 #!/bin/bash
 
-# Concurrent Request Test - 3 Requests (OPTIMAL for 2GB RAM)
-# This tests the optimal number of concurrent requests for your Lightsail setup
+# Sequential Request Test - 3 Requests (Single Processing Mode)
+# Note: System is now configured for single-request processing
+# These requests will be processed sequentially, not concurrently
 
-echo "🚀 Testing 3 concurrent requests (OPTIMAL for 2GB RAM)..."
-echo "⚡ This should work smoothly with your current semaphore limits"
-echo "📊 Expected: All requests succeed, queue time minimal"
+echo "Testing 3 sequential requests (Single Processing Mode)..."
+echo "Note: System processes one request at a time for maximum accuracy"
+echo "Expected: Requests processed sequentially with 30s timeout each"
 echo ""
 
 # Function to make a single request
@@ -13,7 +14,7 @@ make_request() {
     local request_id=$1
     local doc_type=$2
     
-    echo "🔄 Starting request $request_id ($doc_type)..."
+    echo "Starting request $request_id ($doc_type)..."
     
     if [ "$doc_type" == "policy" ]; then
         curl -X POST "http://localhost:8000/api/v1/hackrx/run" \
