@@ -16,8 +16,20 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements first (for better Docker layer caching)
 COPY requirements.txt .
 
-# Install Python dependencies with optimizations for accuracy models
+# Install Python dependencies with proper order for Python 3.10.12
 RUN pip install --no-cache-dir --upgrade pip && \
+    # Remove any existing problematic packages
+    pip uninstall torch transformers sentence-transformers numpy scipy -y || true && \
+    # Install numpy first (critical for other dependencies)
+    pip install --no-cache-dir numpy==1.23.5 && \
+    # Install PyTorch 2.0.1 (CPU version) to fix uint64 error
+    pip install --no-cache-dir torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu && \
+    # Install scipy with compatible version
+    pip install --no-cache-dir scipy==1.9.3 && \
+    # Install transformers and sentence-transformers
+    pip install --no-cache-dir transformers==4.30.2 && \
+    pip install --no-cache-dir sentence-transformers==2.2.2 && \
+    # Install remaining dependencies
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application code

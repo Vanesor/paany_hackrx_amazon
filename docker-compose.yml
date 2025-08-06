@@ -34,7 +34,7 @@ services:
           memory: 1.8G  # Increased for BGE-base model
           cpus: '1.9'   # More CPU for accuracy processing
         reservations:
-          memory: 1.2G  # Higher baseline for BGE-base
+          memory: 1.4G  # Higher baseline for BGE-base
           cpus: '1.2'
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
