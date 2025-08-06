@@ -1,20 +1,21 @@
 #!/bin/bash
 
-# AWS Instance Setup Script for Redis-Enhanced RAG System
+# AWS Instance Setup Script for Accuracy-Optimized RAG System
 # This script sets up the entire environment on a fresh AWS EC2 instance
+# Optimized for BGE-base model without Redis dependency
 
 set -e  # Exit on any error
 
-echo "🚀 Starting AWS Instance Setup for Redis-Enhanced RAG System"
-echo "============================================================"
+echo "🎯 Starting AWS Instance Setup for Accuracy-Optimized RAG System"
+echo "================================================================"
 
 # Update system packages
 echo "📦 Updating system packages..."
 sudo apt-get update -y
 sudo apt-get upgrade -y
 
-# Install required system packages
-echo "🔧 Installing system dependencies..."
+# Install required system packages for accuracy system
+echo "🔧 Installing system dependencies for BGE-base system..."
 sudo apt-get install -y \
     docker.io \
     docker-compose \
@@ -26,7 +27,8 @@ sudo apt-get install -y \
     unzip \
     build-essential \
     python3 \
-    python3-pip
+    python3-pip \
+    python3-dev
 
 # Start and enable Docker
 echo "🐳 Setting up Docker..."
@@ -58,34 +60,26 @@ echo "🔐 Setting up environment configuration..."
 #     echo "   Run: nano .env"
 # fi
 
-# Create required directories
-echo "📂 Creating application directories..."
-mkdir -p cache downloads auto_downloads
+# Create required directories for accuracy system
+echo "📂 Creating application directories for BGE-base models..."
+mkdir -p cache downloads models auto_downloads
 
-# Build and start services
-echo "🏗️  Building and starting services..."
+# Build and start accuracy-optimized services
+echo "🏗️  Building and starting accuracy-optimized services..."
 # sudo docker-compose build
 sudo docker-compose up --build -d
 
-# Wait for services to be ready
-echo "⏳ Waiting for services to start..."
-sleep 30
+# Wait for BGE-base models to load (longer wait time)
+echo "⏳ Waiting for BGE-base models to load (this may take 2-3 minutes)..."
+sleep 120
 
 # Test health endpoints
-echo "🏥 Testing health endpoints..."
+echo "🏥 Testing accuracy system health..."
 if curl -f http://localhost:8000/health > /dev/null 2>&1; then
-    echo "✅ RAG System health check passed"
+    echo "✅ Accuracy-optimized RAG System health check passed"
 else
     echo "❌ RAG System health check failed"
     echo "Check logs with: sudo docker-compose logs rag-system"
-fi
-
-# Check Redis
-if sudo docker exec rag-redis redis-cli ping > /dev/null 2>&1; then
-    echo "✅ Redis health check passed"
-else
-    echo "❌ Redis health check failed"
-    echo "Check logs with: sudo docker-compose logs redis"
 fi
 
 # Display status
@@ -93,23 +87,26 @@ echo ""
 echo "🎉 Setup Complete!"
 echo "==================="
 echo "RAG System URL: http://$(curl -s http://checkip.amazonaws.com):8000"
-echo "Health Check: http://$(curl -s http://checkip.amazonaws.com):8000/health"
+echo "Accuracy System Health: http://$(curl -s http://checkip.amazonaws.com):8000/health"
 echo "API Health: http://$(curl -s http://checkip.amazonaws.com):8000/api/health"
 echo ""
 echo "Management Commands:"
 echo "  Start services:  sudo docker-compose up -d"
 echo "  Stop services:   sudo docker-compose down"
-echo "  View logs:       sudo docker-compose logs -f"
+echo "  View logs:       sudo docker-compose logs -f rag-accuracy-system"
 echo "  Restart:         sudo docker-compose restart"
+echo "  Monitor memory:  sudo docker stats rag-accuracy-system"
 echo ""
 echo "⚠️  Don't forget to:"
 echo "  1. Edit .env file with your GOOGLE_API_KEY"
 echo "  2. Configure AWS Security Groups to allow port 8000"
-echo "  3. Consider setting up SSL/TLS for production"
+echo "  3. Monitor memory usage (BGE-base uses more RAM)"
+echo "  4. Consider setting up SSL/TLS for production"
 
-# Show next steps
+# Show next steps for accuracy system
 echo ""
-echo "Next Steps:"
+echo "Next Steps for Accuracy-Optimized System:"
 echo "1. Edit environment: nano .env"
 echo "2. Restart services: sudo docker-compose restart"
 echo "3. Test API: curl http://localhost:8000/api/v1/hackrx/run -X POST -H 'Content-Type: application/json' -d '{\"query\":\"test\",\"documents\":[\"test doc\"]}'"
+echo "4. Monitor BGE-base model performance with: sudo docker stats"

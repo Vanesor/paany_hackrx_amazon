@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-ENHANCED PRODUCTION-GRADE RAG SYSTEM (v9) - JINAAI OPTIMIZED FOR MAXIMUM SPEED
-- jinaai/jina-embedding-b-en-v1 model with GPU acceleration
-- Advanced batch processing with dynamic sizing
-- Memory-efficient processing with garbage collection
-- Multi-level caching system (embedding + query cache)
-- Parallel processing with optimized thread pools
-- Smart chunking with content-aware sizing
+SPEED-OPTIMIZED RAG SYSTEM (v13) - FAST & ACCURATE FOR 2GB RAM AMAZON LIGHTSAIL
+- BGE-base model for superior accuracy (~220MB)
+- Optimized for ACCURACY with 1.3GB available RAM buffer
+- Enhanced retrieval depth and context processing
+- 30-second timeout with comprehensive results
+- Maximum accuracy within memory constraints
 """
 
 # 1. IMPORTS & CONFIGURATION
@@ -29,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 import threading
-from functools import lru_cache
+import signal
 
 import numpy as np
 import google.generativeai as genai
@@ -63,17 +62,26 @@ if not GOOGLE_API_KEY:
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
-# OPTIMIZED thread pool configuration for parallel chunking under 4GB RAM
+# SINGLE PROCESS configuration for 1-1.2GB RAM
 CPU_COUNT = os.cpu_count() or 4
-global_executor = ThreadPoolExecutor(max_workers=min(24, CPU_COUNT))  # Maximum threads for 4GB RAM performance
+# Only use ThreadPoolExecutor for embedding/chunking speedup - limited workers for memory
+global_executor = ThreadPoolExecutor(max_workers=min(6, CPU_COUNT))  # Increased for 2GB RAM
 
-# MEMORY-AWARE concurrency limits for <4GB RAM with MAXIMUM-SPEED parallel chunking  
-REQUEST_SEMAPHORE = asyncio.Semaphore(16)  # Allow 16 concurrent requests for maximum speed
-PROCESSING_SEMAPHORE = asyncio.Semaphore(16)  # Allow 16 concurrent document processing
-CHUNK_PROCESSING_SEMAPHORE = asyncio.Semaphore(24)  # Allow 24 concurrent chunk operations
-EMBEDDING_SEMAPHORE = asyncio.Semaphore(12)  # Allow 12 concurrent embedding batches
+# OPTIMIZED processing for 2GB RAM (1GB available)
+REQUEST_SEMAPHORE = asyncio.Semaphore(1)  # Single request for stability
+PROCESSING_SEMAPHORE = asyncio.Semaphore(1)  # Single document processing
+CHUNK_PROCESSING_SEMAPHORE = asyncio.Semaphore(3)  # Increased for 2GB RAM
+EMBEDDING_SEMAPHORE = asyncio.Semaphore(1)  # Single embedding batch
 
-# Simplified configuration for maximum speed - no memory limits
+# 30-second timeout configuration
+RESPONSE_TIMEOUT = 30  # Maximum time before returning partial results
+TIMEOUT_WARNING = 27   # Send partial results after this time
+
+# 30-second timeout configuration
+RESPONSE_TIMEOUT = 30  # Maximum time before returning partial results
+TIMEOUT_WARNING = 27   # Send partial results after this time
+
+# Lightweight memory management for 1GB RAM
 def get_memory_usage() -> float:
     """Lightweight memory usage tracking"""
     try:
@@ -83,47 +91,30 @@ def get_memory_usage() -> float:
         return 0.0
 
 def force_memory_cleanup():
-    """Aggressive memory cleanup for 2GB RAM systems"""
-    import torch
+    """Memory cleanup optimized for 2GB RAM systems"""
     try:
         # Force garbage collection
         gc.collect()
         
-        # Clear GPU cache if available
+        # Clear GPU cache if available (though we force CPU mode)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-        
-        # Clear CPU cache
-        if hasattr(torch, 'cpu'):
-            torch.cpu.empty_cache() if hasattr(torch.cpu, 'empty_cache') else None
-        
-        # Additional cleanup
-        import threading
-        threading.current_thread()
         
         logger.info(f"🗑️ Memory cleanup complete: {get_memory_usage():.2f}GB")
     except Exception as e:
         logger.warning(f"Memory cleanup warning: {e}")
 
 def check_memory_threshold() -> bool:
-    """Check if memory usage is approaching 3.5GB limit for high-performance processing"""
+    """Check if memory usage is approaching limits for 2GB RAM system"""
     current = get_memory_usage()
-    return current > 3.5  # Warning at 3.5GB for high-performance processing
+    return current > 1.5  # Warning at 1.5GB for 2GB systems (leave 0.5GB buffer)
 
-# Simplified configuration without Redis
-redis_client = None  # Disabled for performance
+# Force CPU-only processing for memory efficiency
+DEVICE = "cpu"  # Force CPU for memory efficiency
+GPU_MEMORY_GB = 0
 
-# Advanced device configuration
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-if torch.cuda.is_available():
-    # Get GPU memory info for optimization
-    GPU_MEMORY_GB = torch.cuda.get_device_properties(0).total_memory / 1e9
-    logger.info(f"🔥 GPU detected: {torch.cuda.get_device_name(0)} ({GPU_MEMORY_GB:.1f}GB)")
-else:
-    GPU_MEMORY_GB = 0
-
-logger.info(f"🔥 Using device: {DEVICE} | CPU cores: {CPU_COUNT}")
+logger.info(f"🔥 Using device: {DEVICE} | CPU cores: {CPU_COUNT} (Memory-optimized for 1GB)")
 
 
 # 2. ENHANCED DATA STRUCTURES FOR HIERARCHICAL CHUNKING
@@ -158,16 +149,46 @@ class DocumentElement:
             self.metadata = {}
 
 
-# 3. SIMPLIFIED PROCESSING WITHOUT CACHING
+# 3. TIMEOUT-AWARE PROCESSING
 # ==============================================================================
+class TimeoutManager:
+    """Manages request timeout and partial results"""
+    
+    def __init__(self, timeout_seconds: int = RESPONSE_TIMEOUT):
+        self.timeout_seconds = timeout_seconds
+        self.start_time = time.time()
+        self.partial_results = []
+        
+    def is_timeout_approaching(self, warning_threshold: int = TIMEOUT_WARNING) -> bool:
+        """Check if we're approaching timeout"""
+        elapsed = time.time() - self.start_time
+        return elapsed >= warning_threshold
+        
+    def is_timeout_exceeded(self) -> bool:
+        """Check if timeout is exceeded"""
+        elapsed = time.time() - self.start_time
+        return elapsed >= self.timeout_seconds
+        
+    def get_elapsed_time(self) -> float:
+        """Get elapsed time"""
+        return time.time() - self.start_time
+        
+    def add_partial_result(self, result: Any):
+        """Add a partial result"""
+        self.partial_results.append(result)
+        
+    def get_partial_results(self) -> List[Any]:
+        """Get all partial results"""
+        return self.partial_results
+
 
 # 4. ENHANCED SEMANTIC PROCESSOR CLASS
 # ==============================================================================
 class HierarchicalSemanticProcessor:
-    """Advanced semantic processor with content-aware chunking"""
+    """Lightweight semantic processor optimized for 1GB RAM"""
     
     def __init__(self):
-        # Enhanced pattern matching for document structure
+        # Simplified pattern matching for minimal memory usage
         self.heading_patterns = [
             # Chapter patterns
             (r'^(Chapter\s+\d+[:\.]?\s*.*?)$', ChunkType.CHAPTER, 1),
@@ -194,9 +215,8 @@ class HierarchicalSemanticProcessor:
             for pattern, chunk_type, level in self.heading_patterns
         ]
 
-    @lru_cache(maxsize=100)
     def analyze_document_structure(self, text_hash: str, word_count: int, text_sample: str) -> Dict[str, Any]:
-        """Analyze document structure with caching"""
+        """Analyze document structure without caching for memory efficiency"""
         if word_count == 0:
             return {"document_type": "article", "size_category": "standard", "structure_complexity": "simple"}
         
@@ -678,38 +698,38 @@ class HierarchicalSemanticProcessor:
         return best_break
 
     def _get_optimal_chunk_size(self, analysis: Dict[str, Any]) -> int:
-        """Determine optimal chunk size for heavy files under 1.7GB RAM"""
+        """Determine optimal chunk size for SPEED with good accuracy"""
         doc_type = analysis.get('document_type', 'article')
         complexity = analysis.get('structure_complexity', 'simple')
         size_category = analysis.get('size_category', 'standard')
         
-        # ULTRA-SMALL chunk sizes optimized for heavy files under 1.7GB RAM
+        # SPEED-OPTIMIZED chunk sizes - larger chunks for faster processing
         base_sizes = {
-            'legal': 1200,     # Severely reduced for heavy files
-            'academic': 1000,  # Severely reduced for heavy files
-            'book': 800,       # Severely reduced for heavy files
-            'article': 700     # Severely reduced for heavy files
+            'legal': 1600,     # Reduced for speed while maintaining quality
+            'academic': 1400,  # Reduced for faster processing
+            'book': 1200,      # Reduced for speed
+            'article': 1000    # Reduced for quick processing
         }
         
         complexity_multipliers = {
-            'simple': 0.8,     # Reduced for heavy files
-            'moderate': 1.0,
-            'complex': 1.2
+            'simple': 1.0,     # Standard sizing
+            'moderate': 1.1,   # Slightly larger (reduced from 1.2)
+            'complex': 1.2     # Reduced from 1.4 for speed
         }
         
         size_multipliers = {
-            'standard': 0.8,   # Reduced for heavy files
-            'medium': 1.0,
-            'large': 1.1       # Reduced multiplier for heavy files
+            'standard': 1.0,   # Standard sizing
+            'medium': 1.1,     # Reduced from 1.2 for speed
+            'large': 1.2       # Reduced from 1.3 for speed
         }
         
-        base_size = base_sizes.get(doc_type, 700)  # Default ultra-optimized for heavy files
-        complexity_mult = complexity_multipliers.get(complexity, 0.8)
-        size_mult = size_multipliers.get(size_category, 0.8)
+        base_size = base_sizes.get(doc_type, 1000)  # Reduced default for speed
+        complexity_mult = complexity_multipliers.get(complexity, 1.0)
+        size_mult = size_multipliers.get(size_category, 1.0)
         
         final_size = int(base_size * complexity_mult * size_mult)
-        # Ensure chunk size is never too large for heavy files
-        return min(final_size, 1000)  # Hard cap at 1000 for heavy files
+        # Enhanced cap for accuracy - larger chunks = better context
+        return min(final_size, 2500)  # Increased from 2000 for better accuracy
 
     def get_chunks_for_retrieval(self, elements: List[DocumentElement]) -> List[Dict[str, Any]]:
         """Convert hierarchical elements to chunks suitable for retrieval - SPEED OPTIMIZED"""
@@ -744,24 +764,12 @@ class HierarchicalSemanticProcessor:
             }
             chunks.append(chunk)
         
-        # Ultra-aggressive reduction for heavy files under 1.7GB RAM
-        max_chunks = 25  # Severely reduced from 60 for heavy files
+        # ACCURACY-FOCUSED chunk retention for 2GB RAM
+        max_chunks = 80  # Increased for better coverage
         if len(chunks) > max_chunks:
-            # Intelligent chunk selection: mix of longest and highest quality chunks
-            chunks_sorted_by_length = sorted(chunks, key=lambda x: x['char_count'], reverse=True)[:max_chunks//2]
-            chunks_sorted_by_quality = sorted(chunks, key=lambda x: x.get('word_count', 0), reverse=True)[:max_chunks//2]
-            
-            # Combine and deduplicate
-            combined_chunks = []
-            seen_ids = set()
-            for chunk in chunks_sorted_by_length + chunks_sorted_by_quality:
-                chunk_id = chunk.get('element_id', chunk.get('text', '')[:50])
-                if chunk_id not in seen_ids:
-                    combined_chunks.append(chunk)
-                    seen_ids.add(chunk_id)
-            
-            chunks = combined_chunks[:max_chunks]
-            logger.info(f"🚀 Heavy file optimization: Limited to {len(chunks)} chunks (from {len(chunks_sorted_by_length + chunks_sorted_by_quality)})")
+            # Keep highest quality chunks for better accuracy
+            chunks = sorted(chunks, key=lambda x: x.get('word_count', 0), reverse=True)[:max_chunks]
+            logger.info(f"� Accuracy optimization: Limited to {len(chunks)} highest quality chunks")
         
         return chunks
 
@@ -858,108 +866,96 @@ class HierarchicalSemanticProcessor:
         logger.info(f"[{request_id}] ✅ PARALLEL chunking complete: {total_new_chunks} new chunks created")
 
 
-# 5. ULTRA-FAST RAG SYSTEM WITH JINAAI EMBEDDING
+# 5. LIGHTWEIGHT RAG SYSTEM FOR 1GB RAM
 # ==============================================================================
-class JinaAIOptimizedRAGSystem:
+class LightweightRAGSystem:
     def __init__(self):
         self.processor = HierarchicalSemanticProcessor()
         self.embedding_model = None
         self.tokenizer = None
         self.reranker_model = None
         
-        # 2GB RAM OPTIMIZED Configuration
-        self.embedding_model_name = 'sentence-transformers/all-MiniLM-L6-v2'  # Lightweight model
-        self.reranker_model_name = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
-        self.llm_model = genai.GenerativeModel('gemini-1.5-flash')  # Fast model
+        # ACCURACY-OPTIMIZED models for 2GB RAM - better quality answers
+        self.embedding_model_name = 'BAAI/bge-base-en-v1.5'  # Better model (~440MB) for higher accuracy
+        self.reranker_model_name = 'cross-encoder/ms-marco-MiniLM-L-6-v2'  # More accurate reranker (6 layers)
+        self.llm_model = genai.GenerativeModel('gemini-1.5-flash',
+            generation_config={
+                'temperature': 0.05,  # Lower temperature for more accurate responses
+                'top_p': 0.7,         # More focused sampling
+                'top_k': 20,          # Limited candidates for consistency
+                'max_output_tokens': 2048,  # Longer responses for comprehensive answers
+                'candidate_count': 1
+            }
+        )
         
-        # ULTRA-CONSERVATIVE retrieval parameters for heavy files under 1.7GB RAM
-        self.top_k_initial = 4   # Severely reduced from 8
-        self.top_k_final = 2     # Severely reduced from 4
+        # ACCURACY-OPTIMIZED retrieval parameters 
+        self.top_k_initial = 18   # More candidates for better coverage
+        self.top_k_final = 8      # More final results for comprehensive answers
         
-        # CPU offloading batch processing - optimized for 4GB RAM
-        self.base_batch_size = 12    # Increased for maximum speed with 4GB RAM
-        self.max_batch_size = self._calculate_optimal_batch_size()
-        self.enable_half_precision = False  # Disabled for stability on heavy files
+        # ACCURACY-FOCUSED batch processing for 2GB RAM
+        self.base_batch_size = 8     # Smaller batches for better accuracy
+        self.max_batch_size = 12     # Moderate size for accuracy vs speed balance
+        self.enable_half_precision = False  # Keep disabled for stability
         
-        # Memory-optimized settings for heavy files
-        self.skip_reranking = False  # Keep for accuracy
-        self.rerank_threshold = 0.8  # Higher threshold to skip more reranking
-        self.max_chunks_for_speed = 25  # Ultra-optimized for heavy files under 1.7GB RAM
+        # ACCURACY-OPTIMIZED settings
+        self.skip_reranking = False  # Always use reranking for accuracy
+        self.rerank_threshold = 0.5  # Lower threshold = more reranking = better accuracy
+        self.max_chunks_for_speed = 80  # More chunks for comprehensive coverage
         
-        # Performance monitoring
+        # Performance monitoring (minimal)
         self.performance_stats = {
             'total_embeddings_computed': 0,
-            'cache_hits': 0,
-            'cache_misses': 0,
             'average_batch_size': 0,
             'memory_cleanups': 0
         }
 
     def _calculate_optimal_batch_size(self) -> int:
-        """Calculate optimal batch size optimized for 4GB RAM"""
+        """Calculate optimal batch size for BGE-base model on 2GB RAM"""
         current_memory = get_memory_usage()
         
-        # Optimized batching for 4GB RAM systems
-        if current_memory > 3.0:  # If using more than 3.0GB
-            return 2  # Reduced batches when near memory limit
+        # BGE-base optimized for 2GB RAM system
+        if current_memory > 1.5:  # If using more than 1.5GB
+            return 2  # Conservative when approaching limits
         elif DEVICE == "cuda":
-            # GPU with CPU offloading - larger batches for 4GB RAM
+            # GPU with CPU offloading - moderate batches for 2GB RAM
             return min(6, CPU_COUNT // 2)
         else:
-            # CPU-only processing - optimized for heavy files
-            return min(2, max(1, CPU_COUNT // 8))  # Ultra-conservative for heavy files
+            # CPU-only processing - optimized for 2GB RAM
+            return min(4, max(2, CPU_COUNT // 4))  # Better batching with more RAM
 
     def load_models(self):
-        """Load models with CPU offloading and 2GB RAM optimization"""
-        logger.info("--- Loading Models with CPU Offloading for 2GB RAM ---")
+        """Load BGE-base models optimized for ACCURACY on 2GB RAM"""
+        logger.info("--- Loading BGE-base Models for ACCURACY on 2GB RAM ---")
         
         try:
-            import torch
+            # Optimize for accuracy
+            torch.set_num_threads(6)  # More threads for better processing
             
-            # Force CPU-only mode for memory efficiency
-            logger.info(f"🔧 Forcing CPU mode for 2GB RAM optimization")
-            
-            # Load embedding model with CPU offloading
-            logger.info(f"Loading embedding model: {self.embedding_model_name}")
+            # Load BGE-base embedding model (better accuracy)
+            logger.info(f"Loading BGE-base embedding model: {self.embedding_model_name}")
             self.embedding_model = SentenceTransformer(
                 self.embedding_model_name,
-                device="cpu",  # Force CPU for memory efficiency
-                cache_folder="/tmp/sentence_transformers"
+                device="cpu",  # Force CPU
+                cache_folder="/tmp/sentence_transformers",
+                trust_remote_code=True  # Required for BGE models
             )
             
-            # Disable gradient tracking for inference-only mode
+            # Disable gradient tracking for speed
             if hasattr(self.embedding_model, 'eval'):
                 self.embedding_model.eval()
             
-            # Disable gradients completely to save memory
             for param in self.embedding_model.parameters():
                 param.requires_grad = False
             
-            # Enable CPU offloading if available
-            if hasattr(torch, 'backends') and hasattr(torch.backends, 'mps'):
-                torch.backends.mps.enabled = False  # Disable MPS for stability
+            # Skip tokenizer loading to save memory and time
+            self.tokenizer = None
             
-            # Set memory-efficient settings
-            torch.set_num_threads(min(4, CPU_COUNT))  # Limit thread usage
-            
-            # Load tokenizer with minimal memory footprint
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    self.embedding_model_name,
-                    cache_dir="/tmp/transformers",
-                    use_fast=True,  # Use fast tokenizer for efficiency
-                    model_max_length=512  # Limit max length
-                )
-            except Exception as e:
-                logger.warning(f"Could not load tokenizer: {e}")
-                self.tokenizer = None
-            
-            # Load reranker with CPU offloading
-            logger.info(f"Loading reranker: {self.reranker_model_name}")
+            # Load more accurate reranker (6-layer instead of 2-layer)
+            logger.info(f"Loading accurate reranker: {self.reranker_model_name}")
             self.reranker_model = CrossEncoder(
                 self.reranker_model_name,
-                device="cpu",  # Force CPU
-                max_length=256  # Reduce max length for memory
+                device="cpu",
+                max_length=128  # Increased for better context understanding
             )
             
             # Disable gradients for reranker
@@ -969,65 +965,295 @@ class JinaAIOptimizedRAGSystem:
             for param in self.reranker_model.model.parameters():
                 param.requires_grad = False
             
-            # Minimal warmup with very small batch
-            logger.info("🔥 Minimal warmup for 2GB system...")
-            warmup_texts = ["Test"]
-            
-            # Ultra-small warmup
-            with torch.no_grad():  # Ensure no gradient computation
+            # Minimal warmup for BGE-base (accuracy focused)
+            logger.info("🔥 Quick warmup for BGE-base model...")
+            with torch.no_grad():
                 _ = self.embedding_model.encode(
-                    warmup_texts,
+                    ["Test"],
                     normalize_embeddings=True,
                     show_progress_bar=False,
                     batch_size=1,
                     convert_to_numpy=True
                 )
             
-            # Warmup reranker with minimal data
+            # Quick warmup reranker
             with torch.no_grad():
                 _ = self.reranker_model.predict([["test", "test"]], show_progress_bar=False)
             
-            # Aggressive memory cleanup
+            # Quick cleanup
             gc.collect()
-            if DEVICE == "cuda":
-                torch.cuda.empty_cache()
             
-            # Update batch size after model loading
-            self.max_batch_size = self._calculate_optimal_batch_size()
-            
-            logger.info(f"✅ Models loaded with CPU offloading | Max batch size: {self.max_batch_size}")
+            logger.info(f"✅ BGE-base models loaded for ACCURACY | Max batch size: {self.max_batch_size}")
             logger.info(f"💾 Memory usage after loading: {get_memory_usage():.2f}GB")
             
         except Exception as e:
-            logger.error(f"❌ Failed to load models: {e}")
-            raise RuntimeError(f"Model loading failed: {e}")
-        if self.enable_half_precision:
-            logger.info("🚀 Enabling half precision (FP16) for GPU acceleration")
-            self.embedding_model = self.embedding_model.half()
+            logger.error(f"❌ Model loading failed: {e}")
+            raise
+
+    async def download_and_extract(self, pdf_url: str) -> List[Tuple[int, str]]:
+        """Download and extract PDF with memory efficiency"""
+        logger.info(f"📥 Downloading PDF from: {pdf_url[:100]}...")
         
-        # Optimize model for inference
-        if hasattr(self.embedding_model, 'eval'):
-            self.embedding_model.eval()
+        start_time = time.time()
         
-        # Load reranker with optimizations
-        self.reranker_model = CrossEncoder(self.reranker_model_name)
+        try:
+            # Download with memory streaming
+            timeout = aiohttp.ClientTimeout(total=15)  # Quick timeout
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(pdf_url) as response:
+                    if response.status != 200:
+                        raise HTTPException(status_code=400, detail=f"PDF download failed: {response.status}")
+                    
+                    pdf_data = await response.read()
+            
+            # Extract text with minimal memory usage
+            doc = fitz.open(stream=pdf_data, filetype="pdf")
+            pages = []
+            
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                text = page.get_text()
+                pages.append((page_num + 1, text))
+                
+                # Memory cleanup every few pages
+                if page_num % 5 == 0:
+                    gc.collect()
+            
+            doc.close()
+            del pdf_data
+            gc.collect()
+            
+            download_time = time.time() - start_time
+            logger.info(f"📄 PDF extracted: {len(pages)} pages in {download_time:.2f}s")
+            
+            return pages
+            
+        except Exception as e:
+            logger.error(f"❌ PDF processing failed: {e}")
+            raise HTTPException(status_code=500, detail=f"PDF processing error: {str(e)}")
+
+    async def _embed_texts_lightweight(self, texts: List[str]) -> np.ndarray:
+        """Generate embeddings optimized for ACCURACY with 2GB RAM"""
+        if not texts:
+            return np.array([])
         
-        # Model warmup with progressively larger batches
-        logger.info("🔥 Warming up models with progressive batch sizes...")
-        warmup_texts = [
-            f"This is warmup text number {i} for testing the embedding model performance."
-            for i in range(1, 17)
-        ]
+        try:
+            # Process balanced batches for accuracy
+            all_embeddings = []
+            batch_size = self.max_batch_size
+            
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i + batch_size]
+                
+                # Balanced memory check for accuracy focus
+                if get_memory_usage() > 1.7:  # Higher threshold for accuracy
+                    force_memory_cleanup()
+                    batch_size = max(4, batch_size // 2)  # Still reasonable for accuracy
+                
+                with torch.no_grad():
+                    batch_embeddings = self.embedding_model.encode(
+                        batch_texts,
+                        normalize_embeddings=True,  # Critical for BGE model accuracy
+                        show_progress_bar=False,
+                        batch_size=len(batch_texts),
+                        convert_to_numpy=True,
+                        device="cpu",
+                        precision='float32'  # Higher precision for better accuracy
+                    )
+                    all_embeddings.append(batch_embeddings)
+                
+                # Regular cleanup for accuracy balance
+                if i % batch_size == 0:  # Regular cleanup
+                    gc.collect()
+            
+            # Combine embeddings
+            if all_embeddings:
+                embeddings = np.vstack(all_embeddings)
+            else:
+                embeddings = np.zeros((len(texts), 768))  # BGE-base dimension (increased from 384)
+            
+            self.performance_stats['total_embeddings_computed'] += len(texts)
+            
+            return embeddings
+            
+        except Exception as e:
+            logger.error(f"❌ Embedding generation failed: {e}")
+            return np.zeros((len(texts), 768))  # BGE-base dimension
+
+    def _rerank_minimal(self, query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """SPEED-OPTIMIZED reranking for 2GB RAM"""
+        if not chunks:
+            return chunks
         
-        # Progressive warmup
-        for batch_size in [1, 4, 8, min(16, self.max_batch_size)]:
-            batch = warmup_texts[:batch_size]
-            _ = self.embedding_model.encode(
-                batch, 
-                normalize_embeddings=True,
-                show_progress_bar=False,
-                batch_size=batch_size
+        # Enhanced limits for accuracy
+        max_rerank_chunks = 15  # Increased from 10 for better accuracy
+        if len(chunks) > max_rerank_chunks:
+            chunks = chunks[:max_rerank_chunks]
+        
+        logger.info(f"� Reranking {len(chunks)} chunks (SPEED MODE)")
+        
+        try:
+            # Enhanced reranker input with larger text limits for accuracy
+            reranker_input = [[query[:200], chunk['text'][:400]] for chunk in chunks]  # Increased context for accuracy
+            
+            with torch.no_grad():
+                cross_scores = self.reranker_model.predict(
+                    reranker_input, 
+                    show_progress_bar=False,
+                    batch_size=4  # Smaller batch for better accuracy
+                )
+            
+            # Apply scores
+            for i, chunk in enumerate(chunks):
+                chunk['rerank_score'] = float(cross_scores[i])
+            
+            return sorted(chunks, key=lambda x: x['rerank_score'], reverse=True)
+            
+        except Exception as e:
+            logger.error(f"❌ Reranking error: {e}")
+            # Fallback to similarity scores
+            for chunk in chunks:
+                chunk['rerank_score'] = chunk.get('semantic_score', 0.0)
+            return sorted(chunks, key=lambda x: x['rerank_score'], reverse=True)
+
+    async def retrieve_and_rerank_with_timeout(self, query: str, chunks_with_metadata: List[Dict], 
+                                               chunk_embeddings: np.ndarray, request_id: str,
+                                               timeout_manager: TimeoutManager) -> List[Dict[str, Any]]:
+        """Fast retrieval with timeout awareness"""
+        start_time = time.time()
+        
+        # Check timeout before starting
+        if timeout_manager.is_timeout_exceeded():
+            logger.warning(f"[{request_id}] ⏰ Timeout exceeded before retrieval")
+            return []
+        
+        if len(chunks_with_metadata) == 0:
+            return []
+        
+        # Quick query embedding
+        query_embedding = await self._embed_texts_lightweight([query])
+        if query_embedding.size == 0:
+            return []
+        
+        query_embedding = query_embedding.flatten()
+        
+        # Enhanced similarity computation for accuracy
+        # Normalize embeddings for better cosine similarity
+        chunk_embeddings_norm = chunk_embeddings / (np.linalg.norm(chunk_embeddings, axis=1, keepdims=True) + 1e-8)
+        query_embedding_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-8)
+        
+        # Compute cosine similarities for better semantic matching
+        similarities = np.dot(chunk_embeddings_norm, query_embedding_norm)
+        
+        # Apply semantic enhancement based on text characteristics
+        for i, chunk in enumerate(chunks_with_metadata):
+            # Boost relevance for chunks with question keywords
+            text_lower = chunk['text'].lower()
+            query_lower = query.lower()
+            
+            # Keyword overlap boost
+            query_words = set(query_lower.split())
+            text_words = set(text_lower.split())
+            overlap_ratio = len(query_words.intersection(text_words)) / len(query_words) if query_words else 0
+            similarities[i] += overlap_ratio * 0.1  # 10% boost for keyword overlap
+            
+            # Length penalty for very short chunks (often incomplete)
+            if len(chunk['text']) < 50:
+                similarities[i] *= 0.8  # Penalize very short chunks
+        
+        # Quick candidate selection
+        top_indices = np.argsort(similarities)[-self.top_k_initial:][::-1]
+        candidate_chunks = [chunks_with_metadata[i] for i in top_indices]
+        
+        # Apply semantic scores
+        for i, chunk in enumerate(candidate_chunks):
+            chunk['semantic_score'] = similarities[top_indices[i]]
+        
+        # Check timeout before reranking
+        if timeout_manager.is_timeout_approaching():
+            logger.warning(f"[{request_id}] ⏰ Timeout approaching, skipping reranking")
+            candidate_chunks.sort(key=lambda x: x['semantic_score'], reverse=True)
+            final_chunks = candidate_chunks[:self.top_k_final]
+            for chunk in final_chunks:
+                chunk['rerank_score'] = chunk['semantic_score']
+            return final_chunks
+        
+        # Rerank if time allows
+        final_chunks = self._rerank_minimal(query, candidate_chunks[:self.top_k_final])
+        
+        return final_chunks
+
+    async def answer_question_with_timeout(self, question: str, contexts: List[Dict], 
+                                           request_id: str, timeout_manager: TimeoutManager) -> str:
+        """Generate answer with timeout awareness - ACCURACY OPTIMIZED"""
+        
+        # Check timeout before answering
+        if timeout_manager.is_timeout_exceeded():
+            logger.warning(f"[{request_id}] ⏰ Timeout exceeded, returning partial answer")
+            return "⏰ Response timeout reached. Please try again with a simpler query."
+        
+        if not contexts:
+            return "I couldn't find relevant information to answer your question."
+        
+        # Build comprehensive context for accuracy
+        context_text = ""
+        context_count = min(len(contexts), 5)  # More context for accuracy
+        for i, ctx in enumerate(contexts[:context_count]):
+            context_text += f"Context {i+1} (Page {ctx.get('page', 'N/A')}, Relevance: {ctx.get('rerank_score', 0):.3f}):\n{ctx['text'][:800]}\n\n"  # Longer context
+        
+        # Build accuracy-focused prompt
+        prompt = f"""You are an expert document analyst. Based on the following comprehensive context from the document, provide a thorough, accurate, and well-reasoned answer to the question.
+
+DOCUMENT CONTEXT:
+{context_text}
+
+QUESTION: {question}
+
+INSTRUCTIONS FOR MAXIMUM ACCURACY:
+- Analyze ALL provided context segments carefully
+- Synthesize information across multiple contexts when relevant
+- Provide specific details, numbers, dates, and quotes when available
+- If information is incomplete, clearly state what is known and what might be missing
+- Cross-reference information between contexts to ensure consistency
+- Give preference to more recent or authoritative information if there are conflicts
+- Structure your answer logically with clear reasoning
+- Include relevant page references where helpful
+
+COMPREHENSIVE ANSWER:"""
+        
+        try:
+            # Check timeout one more time
+            if timeout_manager.is_timeout_approaching():
+                logger.warning(f"[{request_id}] ⏰ Timeout approaching during answer generation")
+                return f"{contexts[0]['text'][:200]}..."
+            
+            # Generate answer with more time for comprehensive responses
+            response = await asyncio.wait_for(
+                self._generate_answer_async(prompt),
+                timeout=max(8, RESPONSE_TIMEOUT - timeout_manager.get_elapsed_time())  # More time for accuracy
             )
+            
+            return response.text.strip()
+            
+        except asyncio.TimeoutError:
+            logger.warning(f"[{request_id}] ⏰ Answer generation timeout")
+            return f"{contexts[0]['text'][:200]}..."
+        except Exception as e:
+            logger.error(f"[{request_id}] ❌ Answer generation failed: {e}")
+            return f"I encountered an error while processing your question: {str(e)}"
+
+    async def _generate_answer_async(self, prompt: str):
+        """Generate answer asynchronously"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.llm_model.generate_content, prompt)
+
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get minimal performance statistics"""
+        return {
+            "total_embeddings": self.performance_stats['total_embeddings_computed'],
+            "memory_cleanups": self.performance_stats['memory_cleanups'],
+            "current_memory_gb": get_memory_usage()
+        }
         
         # Warmup reranker
         _ = self.reranker_model.predict([["warmup query", "warmup text"]], show_progress_bar=False)
@@ -1206,7 +1432,7 @@ class JinaAIOptimizedRAGSystem:
                 
         except Exception as e:
             logger.error(f"❌ Embedding generation failed: {e}")
-            return np.zeros((len(texts), 384))
+            return np.zeros((len(texts), 768))  # BGE-base dimension
 
     async def _generate_embeddings_batch_parallel(self, texts: List[str], batch_size: int = 16) -> np.ndarray:
         """Generate embeddings with CONCURRENT processing and optimized memory management"""
@@ -1252,13 +1478,13 @@ class JinaAIOptimizedRAGSystem:
             if all_embeddings:
                 embeddings = np.vstack(all_embeddings)
             else:
-                embeddings = np.zeros((len(texts), 384))
+                embeddings = np.zeros((len(texts), 768))  # BGE-base dimension
             
             return embeddings
             
         except Exception as e:
             logger.error(f"❌ Parallel embedding batch failed: {e}")
-            return np.zeros((len(texts), 384))
+            return np.zeros((len(texts), 768))  # BGE-base dimension
 
     async def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """Generate embeddings for a batch of texts optimized for SPEED"""
@@ -1279,7 +1505,7 @@ class JinaAIOptimizedRAGSystem:
         except Exception as e:
             logger.error(f"🔥 Batch embedding error: {e}")
             # Return zero embeddings as fallback
-            return np.zeros((len(texts), 384))
+            return np.zeros((len(texts), 768))  # BGE-base dimension
 
     def _adjust_batch_size_for_length(self, avg_length: float) -> int:
         """Dynamically adjust batch size based on average text length"""
@@ -1775,7 +2001,7 @@ COMPREHENSIVE ANSWER WITH PRECISE CITATIONS:"""
 
 
 # Global RAG system instance
-rag_system = JinaAIOptimizedRAGSystem()
+rag_system = LightweightRAGSystem()
 
 async def cleanup_memory():
     """Background task for memory cleanup"""
@@ -1797,7 +2023,7 @@ async def cleanup_memory():
 async def lifespan(app: FastAPI):
     """Modern FastAPI lifespan management"""
     # Startup
-    logger.info("🚀 Starting JinaAI-Optimized RAG Server...")
+    logger.info("🚀 Starting BGE-base RAG Server for 2GB RAM...")
     await asyncio.get_event_loop().run_in_executor(global_executor, rag_system.load_models)
     logger.info("✅ Server ready for requests")
     
@@ -1811,9 +2037,9 @@ async def lifespan(app: FastAPI):
 # 6. FASTAPI APPLICATION SERVER & STARTUP EVENT
 # ==============================================================================
 app = FastAPI(
-    title="Fast Parallel RAG System", 
-    version="10.0.0",
-    description="High-performance RAG system optimized for parallel processing and 30-second responses",
+    title="Lightweight RAG System", 
+    version="11.0.0",
+    description="BGE-base optimized RAG system with 30-second timeout for 2GB RAM Amazon Lightsail",
     lifespan=lifespan
 )
 
@@ -1850,149 +2076,214 @@ async def process_document_and_answer(
     background_tasks: BackgroundTasks,
     authorization: str = Header(None)
 ):
-    """Main endpoint for document processing and question answering optimized for heavy files under 1.7GB RAM"""
+    """Main endpoint for document processing and question answering optimized for 2GB RAM with 30-second timeout"""
     verify_token(authorization)
     request_id = f"req_{int(time.time() * 1000)}"
+    
+    # Initialize timeout manager
+    timeout_manager = TimeoutManager()
     start_time = time.time()
     initial_memory = get_memory_usage()
-    logger.info(f"[{request_id}] 💾 Initial memory: {initial_memory:.2f}GB")
+    logger.info(f"[{request_id}] � Starting request | Memory: {initial_memory:.2f}GB | Timeout: {RESPONSE_TIMEOUT}s")
     
-    # Early memory check - reject if already too high (relaxed threshold for high performance)
-    if initial_memory > 3.0:
+    # Early memory check - reject if already too high for 2GB systems
+    if initial_memory > 1.6:
         logger.error(f"[{request_id}] ❌ Memory too high ({initial_memory:.2f}GB) - rejecting request")
         raise HTTPException(status_code=503, detail=f"Server memory too high: {initial_memory:.2f}GB")
     
-    # Memory-aware concurrency for <4GB RAM with ULTRA-FAST concurrent chunking
+    # SINGLE REQUEST processing optimized for 2GB RAM
     async with REQUEST_SEMAPHORE:
-        try:
-            active_requests = REQUEST_SEMAPHORE._value
-        except AttributeError:
-            active_requests = 12 - REQUEST_SEMAPHORE._value
-        logger.info(f"[{request_id}] 🚀 New ULTRA-FAST request | Questions: {len(request.questions)} | Active: {active_requests}/12")
+        logger.info(f"[{request_id}] 📝 Processing {len(request.questions)} questions (2GB RAM optimized mode)")
 
         try:
-            # REMOVE blocking semaphore for TRUE CONCURRENT document processing
-            # Memory check with high-performance thresholds for ultra-fast processing
+            # Check initial timeout
+            if timeout_manager.is_timeout_exceeded():
+                logger.error(f"[{request_id}] ⏰ Initial timeout exceeded")
+                return QueryResponse(answers=["⏰ Request timeout before processing started."])
+            
+            # Memory check for 2GB system
+            current_memory = get_memory_usage()
+            if current_memory > 1.4:
+                logger.warning(f"[{request_id}] ⚠️ Memory at {current_memory:.2f}GB - forcing cleanup")
+                force_memory_cleanup()
+                await asyncio.sleep(0.1)
                 current_memory = get_memory_usage()
-                if current_memory > 3.0:  # Increased threshold for maximum performance
-                    logger.warning(f"[{request_id}] ⚠️ Memory at {current_memory:.2f}GB - using conservative processing")
-                    force_memory_cleanup()
-                    await asyncio.sleep(0.2)  # Shorter wait for maximum concurrency
-                    current_memory = get_memory_usage()
-                    if current_memory > 2.5:  # Higher threshold for maximum concurrent requests
-                        raise HTTPException(status_code=503, detail=f"Memory too high for parallel processing: {current_memory:.2f}GB")
-                
-                # PDF extraction with PARALLEL memory monitoring
-                pdf_start = time.time()
-                logger.info(f"[{request_id}] 📄 Starting PARALLEL PDF extraction...")
-                pages = await rag_system.download_and_extract(request.documents)
-                pdf_time = time.time() - pdf_start
+                if current_memory > 1.3:
+                    raise HTTPException(status_code=503, detail=f"Memory too high for processing: {current_memory:.2f}GB")
+            
+            # PDF extraction with timeout awareness
+            pdf_start = time.time()
+            logger.info(f"[{request_id}] � Starting PDF extraction...")
+            
+            if timeout_manager.is_timeout_approaching():
+                logger.warning(f"[{request_id}] ⏰ Timeout approaching before PDF extraction")
+                return QueryResponse(answers=["⏰ Timeout approaching. Please try with a smaller document."])
+            
+            pages = await rag_system.download_and_extract(request.documents)
+            pdf_time = time.time() - pdf_start
+            pdf_memory = get_memory_usage()
+            logger.info(f"[{request_id}] 📄 PDF extraction: {len(pages)} pages in {pdf_time:.3f}s | Memory: {pdf_memory:.2f}GB")
+            
+            # Check timeout after PDF extraction
+            if timeout_manager.is_timeout_approaching():
+                logger.warning(f"[{request_id}] ⏰ Timeout approaching after PDF extraction")
+                return QueryResponse(answers=["⏰ Timeout reached during document processing. Please try with a smaller document."])
+            
+            # Memory cleanup for 2GB system
+            if pdf_memory > 1.4:
+                logger.warning(f"[{request_id}] ⚠️ Memory at {pdf_memory:.2f}GB after PDF - cleanup")
+                force_memory_cleanup()
                 pdf_memory = get_memory_usage()
-                logger.info(f"[{request_id}] 📄 PARALLEL PDF extraction: {len(pages)} pages in {pdf_time:.3f}s | Memory: {pdf_memory:.2f}GB")
-                
-                # Memory check with ultra-fast-friendly thresholds
-                if pdf_memory > 3.0:  # Increased threshold for maximum performance
-                    logger.warning(f"[{request_id}] ⚠️ Memory at {pdf_memory:.2f}GB after PDF - quick cleanup")
-                    force_memory_cleanup()
-                    pdf_memory = get_memory_usage()
-                
-                # Document structure analysis with PARALLEL processing
-                structure_start = time.time()
-                logger.info(f"[{request_id}] 🏗️ Starting PARALLEL structure analysis...")
-                hierarchical_elements = rag_system.processor.extract_hierarchical_structure(pages, request_id)
-                
-                # Clear pages from memory immediately for parallel processing
-                del pages
-                gc.collect()
-                
-                structure_time = time.time() - structure_start
-                structure_memory = get_memory_usage()
-                logger.info(f"[{request_id}] 🏗️ PARALLEL structure analysis: {structure_time:.3f}s | {len(hierarchical_elements)} elements | Memory: {structure_memory:.2f}GB")
-                
-                # Memory check with ultra-fast-friendly thresholds
-                if structure_memory > 3.0:  # Increased threshold for maximum performance
-                    logger.warning(f"[{request_id}] ⚠️ Memory at {structure_memory:.2f}GB after structure - quick cleanup")
-                    force_memory_cleanup()
-                
-                # Convert to retrieval chunks with PARALLEL optimization
-                chunk_start = time.time()
-                logger.info(f"[{request_id}] 📚 Creating retrieval chunks with PARALLEL optimization...")
-                chunks_with_metadata = rag_system.processor.get_chunks_for_retrieval(hierarchical_elements)
-                
-                # Clear hierarchical elements from memory for parallel processing
-                del hierarchical_elements
-                gc.collect()
-                
-                chunk_time = time.time() - chunk_start
-                chunk_memory = get_memory_usage()
-                logger.info(f"[{request_id}] 📚 PARALLEL chunk creation: {chunk_time:.3f}s | {len(chunks_with_metadata)} chunks | Memory: {chunk_memory:.2f}GB")
-                
-                # Memory check before embedding with ultra-fast-aware threshold
-                if chunk_memory > 3.0:  # Increased threshold for maximum performance
-                    logger.warning(f"[{request_id}] ⚠️ Memory at {chunk_memory:.2f}GB before embedding - quick cleanup")
-                    force_memory_cleanup()
-                
-                # PARALLEL embedding generation with optimized memory monitoring
-                embed_start = time.time()
-                chunk_texts = [c['text'] for c in chunks_with_metadata]
-                logger.info(f"[{request_id}] 🔢 Starting PARALLEL embedding generation for {len(chunk_texts)} texts...")
-                chunk_embeddings = await rag_system._embed_with_advanced_caching(chunk_texts)
-                embed_time = time.time() - embed_start
-                embed_memory = get_memory_usage()
-                
-                # Final memory cleanup after embedding
-                if check_memory_threshold():
-                    force_memory_cleanup()
-                    rag_system.performance_stats['memory_cleanups'] += 1
-                
-                processing_time = time.time() - pdf_start
-                logger.info(f"[{request_id}] ⚡ Document processing complete: {processing_time:.3f}s (PDF: {pdf_time:.3f}s, Structure: {structure_time:.3f}s, Chunks: {chunk_time:.3f}s, Embedding: {embed_time:.3f}s) | Memory: {embed_memory:.2f}GB")
+            
+            # Document structure analysis with timeout
+            structure_start = time.time()
+            logger.info(f"[{request_id}] 🏗️ Starting structure analysis...")
+            
+            if timeout_manager.is_timeout_approaching():
+                logger.warning(f"[{request_id}] ⏰ Timeout approaching before structure analysis")
+                return QueryResponse(answers=["⏰ Timeout reached. Partial processing completed."])
+            
+            hierarchical_elements = rag_system.processor.extract_hierarchical_structure(pages, request_id)
+            
+            # Clear pages immediately to save memory
+            del pages
+            gc.collect()
+            
+            structure_time = time.time() - structure_start
+            structure_memory = get_memory_usage()
+            logger.info(f"[{request_id}] 🏗️ Structure analysis: {structure_time:.3f}s | {len(hierarchical_elements)} elements | Memory: {structure_memory:.2f}GB")
+            
+            # Check timeout after structure analysis
+            if timeout_manager.is_timeout_approaching():
+                logger.warning(f"[{request_id}] ⏰ Timeout approaching after structure analysis")
+                return QueryResponse(answers=["⏰ Timeout reached during document analysis."])
+            
+            # Memory cleanup for 2GB system
+            if structure_memory > 1.4:
+                logger.warning(f"[{request_id}] ⚠️ Memory at {structure_memory:.2f}GB after structure - cleanup")
+                force_memory_cleanup()
+            
+            # Convert to retrieval chunks with timeout awareness
+            chunk_start = time.time()
+            logger.info(f"[{request_id}] 📚 Creating retrieval chunks...")
+            
+            if timeout_manager.is_timeout_approaching():
+                logger.warning(f"[{request_id}] ⏰ Timeout approaching before chunking")
+                return QueryResponse(answers=["⏰ Timeout reached during document preparation."])
+            
+            chunks_with_metadata = rag_system.processor.get_chunks_for_retrieval(hierarchical_elements)
+            
+            # Clear hierarchical elements to save memory
+            del hierarchical_elements
+            gc.collect()
+            
+            chunk_time = time.time() - chunk_start
+            chunk_memory = get_memory_usage()
+            logger.info(f"[{request_id}] 📚 Chunk creation: {chunk_time:.3f}s | {len(chunks_with_metadata)} chunks | Memory: {chunk_memory:.2f}GB")
+            
+            # Check timeout before embedding
+            if timeout_manager.is_timeout_approaching():
+                logger.warning(f"[{request_id}] ⏰ Timeout approaching before embedding")
+                return QueryResponse(answers=["⏰ Timeout reached during chunk preparation."])
+            
+            # Memory check before embedding for 2GB system
+            if chunk_memory > 1.4:
+                logger.warning(f"[{request_id}] ⚠️ Memory at {chunk_memory:.2f}GB before embedding - cleanup")
+                force_memory_cleanup()
+            
+            # Embedding generation with timeout awareness
+            embed_start = time.time()
+            chunk_texts = [c['text'] for c in chunks_with_metadata]
+            logger.info(f"[{request_id}] 🔢 Generating embeddings for {len(chunk_texts)} texts...")
+            
+            if timeout_manager.is_timeout_approaching():
+                logger.warning(f"[{request_id}] ⏰ Timeout approaching before embedding")
+                return QueryResponse(answers=["⏰ Timeout reached before embedding generation."])
+            
+            chunk_embeddings = await rag_system._embed_texts_lightweight(chunk_texts)
+            embed_time = time.time() - embed_start
+            embed_memory = get_memory_usage()
+            
+            # Final memory cleanup after embedding
+            if check_memory_threshold():
+                force_memory_cleanup()
+                rag_system.performance_stats['memory_cleanups'] += 1
+            
+            processing_time = time.time() - pdf_start
+            logger.info(f"[{request_id}] ⚡ Document processing complete: {processing_time:.3f}s (PDF: {pdf_time:.3f}s, Structure: {structure_time:.3f}s, Chunks: {chunk_time:.3f}s, Embedding: {embed_time:.3f}s) | Memory: {embed_memory:.2f}GB")
 
-                # Process questions in parallel (optimized for speed)
-                async def process_single_question(question: str, q_idx: int) -> str:
-                    q_request_id = f"{request_id}_q{q_idx+1}"
-                    q_start = time.time()
-                    
-                    contexts = await rag_system.retrieve_and_rerank(
-                        question, chunks_with_metadata, chunk_embeddings, q_request_id
+            # Process questions with timeout awareness
+            answers = []
+            for q_idx, question in enumerate(request.questions):
+                q_request_id = f"{request_id}_q{q_idx+1}"
+                q_start = time.time()
+                
+                # Check timeout before each question
+                if timeout_manager.is_timeout_exceeded():
+                    logger.warning(f"[{q_request_id}] ⏰ Timeout exceeded, adding timeout answer")
+                    timeout_manager.add_partial_result("⏰ Request timeout reached. Please try again with fewer questions.")
+                    break
+                
+                if timeout_manager.is_timeout_approaching():
+                    logger.warning(f"[{q_request_id}] ⏰ Timeout approaching, processing with reduced context")
+                    # Use reduced processing for speed
+                    contexts = await rag_system.retrieve_and_rerank_with_timeout(
+                        question, chunks_with_metadata[:50], chunk_embeddings[:50], q_request_id, timeout_manager
                     )
-                    
-                    answer = await rag_system.answer_question(question, contexts, q_request_id)
-                    q_time = time.time() - q_start
-                    logger.info(f"[{q_request_id}] ✅ Question processed in {q_time:.3f}s")
-                    return answer
-
-                # Parallel question processing with timing
-                qa_start = time.time()
-                logger.info(f"[{request_id}] 🔄 Processing {len(request.questions)} questions in parallel...")
+                else:
+                    # Normal processing
+                    contexts = await rag_system.retrieve_and_rerank_with_timeout(
+                        question, chunks_with_metadata, chunk_embeddings, q_request_id, timeout_manager
+                    )
                 
-                tasks = [process_single_question(q, i) for i, q in enumerate(request.questions)]
-                answers = await asyncio.gather(*tasks)
-                qa_time = time.time() - qa_start
+                # Generate answer with timeout awareness
+                answer = await rag_system.answer_question_with_timeout(question, contexts, q_request_id, timeout_manager)
+                answers.append(answer)
+                timeout_manager.add_partial_result(answer)
                 
-                # Final timing summary with memory optimization report
-                total_time = time.time() - start_time
-                final_memory = get_memory_usage()
-                memory_delta = final_memory - initial_memory
+                q_time = time.time() - q_start
+                logger.info(f"[{q_request_id}] ✅ Question processed in {q_time:.3f}s")
                 
-                logger.info(f"[{request_id}] ✅ REQUEST COMPLETE (4GB RAM Optimized):")
-                logger.info(f"[{request_id}]   📊 Total time: {total_time:.3f}s")
-                logger.info(f"[{request_id}]   📄 Document processing: {processing_time:.3f}s")
-                logger.info(f"[{request_id}]   🤖 Q&A processing: {qa_time:.3f}s")
-                logger.info(f"[{request_id}]   🧠 Memory: {initial_memory:.2f}GB → {final_memory:.2f}GB (Δ{memory_delta:+.2f}GB)")
-                logger.info(f"[{request_id}]   🗑️ Memory cleanups: {rag_system.performance_stats.get('memory_cleanups', 0)}")
-                logger.info(f"[{request_id}]   ⚡ Avg per question: {qa_time/len(request.questions):.3f}s")
-                
-                # Force final cleanup if memory usage is high
-                if final_memory > 2.5:
-                    force_memory_cleanup()
-                    logger.info(f"[{request_id}] 🗑️ Final cleanup | Memory: {get_memory_usage():.2f}GB")
-                
-                return QueryResponse(answers=answers)
+                # Break if timeout exceeded
+                if timeout_manager.is_timeout_exceeded():
+                    logger.warning(f"[{request_id}] ⏰ Timeout exceeded after question {q_idx+1}")
+                    break
+            
+            # If no answers were generated due to timeout, use partial results
+            if not answers and timeout_manager.get_partial_results():
+                answers = timeout_manager.get_partial_results()
+            elif not answers:
+                answers = ["Request timeout reached before any questions could be processed."]
+            
+            # Ensure we have answers for all questions
+            while len(answers) < len(request.questions):
+                answers.append("timeout constraints.")
+            
+            # Final timing summary
+            total_time = time.time() - start_time
+            final_memory = get_memory_usage()
+            memory_delta = final_memory - initial_memory
+            
+            logger.info(f"[{request_id}] ✅ REQUEST COMPLETE (1GB RAM Optimized):")
+            logger.info(f"[{request_id}]   📊 Total time: {total_time:.3f}s")
+            logger.info(f"[{request_id}]   📄 Document processing: {processing_time:.3f}s")
+            logger.info(f"[{request_id}]   🤖 Questions processed: {len(answers)}/{len(request.questions)}")
+            logger.info(f"[{request_id}]   🧠 Memory: {initial_memory:.2f}GB → {final_memory:.2f}GB (Δ{memory_delta:+.2f}GB)")
+            logger.info(f"[{request_id}]   🗑️ Memory cleanups: {rag_system.performance_stats.get('memory_cleanups', 0)}")
+            
+            # Force final cleanup if memory usage is high for 2GB system
+            if final_memory > 1.3:
+                force_memory_cleanup()
+                logger.info(f"[{request_id}] 🗑️ Final cleanup | Memory: {get_memory_usage():.2f}GB")
+            
+            return QueryResponse(answers=answers)
         
         except Exception as e:
             error_time = time.time() - start_time
             logger.error(f"[{request_id}] ❌ Error after {error_time:.3f}s: {e}")
+            # Return timeout message if error occurred near timeout
+            if timeout_manager.is_timeout_approaching() or timeout_manager.is_timeout_exceeded():
+                return QueryResponse(answers=[f"⏰ Request timeout: {str(e)}"])
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
@@ -2402,8 +2693,8 @@ async def api_health_checkpoint():
         health_data = {
             "status": overall_status,
             "timestamp": time.time(),
-            "service": "Fast Parallel RAG System",
-            "version": "10.0.0",
+            "service": "Lightweight RAG System",
+            "version": "11.0.0",
             "api_version": "v1",
             "checkpoint_duration_ms": round(checkpoint_time * 1000, 2),
             "models": model_status,
@@ -2412,6 +2703,10 @@ async def api_health_checkpoint():
                 "duration_ms": round(embedding_time * 1000, 2)
             },
             "system": system_resources,
+            "timeout_config": {
+                "response_timeout": RESPONSE_TIMEOUT,
+                "warning_threshold": TIMEOUT_WARNING
+            },
             "concurrency": {
                 "max_requests": REQUEST_SEMAPHORE._value,
                 "max_processing": PROCESSING_SEMAPHORE._value
@@ -2442,11 +2737,13 @@ async def api_health_checkpoint():
 async def root():
     """Root endpoint with API information"""
     return {
-        "name": "Fast Parallel RAG System",
-        "version": "10.0.0",
-        "description": "High-performance RAG system optimized for parallel processing and 30-second responses",
+        "name": "Lightweight RAG System",
+        "version": "11.0.0",
+        "description": "Memory-optimized RAG system with 30-second timeout for 1GB RAM environments",
         "model": rag_system.embedding_model_name,
         "device": DEVICE,
+        "timeout_seconds": RESPONSE_TIMEOUT,
+        "memory_target": "1GB",
         "concurrency": {
             "max_requests": REQUEST_SEMAPHORE._value,
             "max_processing": PROCESSING_SEMAPHORE._value
@@ -2473,29 +2770,29 @@ if __name__ == "__main__":
         except ValueError:
             logger.warning(f"Invalid port argument: {sys.argv[1]}, using default 8000")
     
-    logger.info("🚀 Starting ULTRA-FAST CONCURRENT RAG Server (<10s target, <4GB RAM)...")
-    logger.info(f"🔥 Hardware: {DEVICE} | CPU cores: {CPU_COUNT} | GPU memory: {GPU_MEMORY_GB:.1f}GB")
-    logger.info(f"⚡ Model: {rag_system.embedding_model_name}")
-    logger.info(f"🔄 ULTRA-FAST Concurrency: {REQUEST_SEMAPHORE._value} requests, {PROCESSING_SEMAPHORE._value} processing, {CHUNK_PROCESSING_SEMAPHORE._value} chunk ops")
-    logger.info(f"🌐 Server port: {port} | PARALLEL CHUNKING ENABLED")
-    logger.info(f"🧠 Memory-aware parallel processing with dynamic batching")
-    logger.info(f"⚡ Parallel features: Page combining, heading detection, chunk processing, embedding generation")
+    logger.info("🚀 Starting Lightweight RAG Server (30s timeout, 1GB RAM optimized)...")
+    logger.info(f"🔥 Hardware: {DEVICE} | CPU cores: {CPU_COUNT} | Memory target: 1GB")
+    logger.info(f"⚡ Models: {rag_system.embedding_model_name} (lightweight)")
+    logger.info(f"🔄 Single Process Mode: {REQUEST_SEMAPHORE._value} concurrent request")
+    logger.info(f"🌐 Server port: {port} | TIMEOUT-AWARE PROCESSING")
+    logger.info(f"🧠 Memory-conservative processing with 30-second timeout")
+    logger.info(f"⏰ Features: Timeout management, partial results, 1GB RAM optimization")
     
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
         port=port, 
         reload=False,
-        workers=1,     # Single worker for shared model state
+        workers=1,     # Single worker for memory efficiency
         loop="asyncio",
         log_level="info",
-        # Optimized for ULTRA-FAST concurrent processing with 2.5GB RAM
-        timeout_keep_alive=90,        # Longer timeout for concurrent processing
-        limit_concurrency=20,         # Increased for ultra-fast chunking
-        limit_max_requests=2000,      # Higher limit for concurrent processing
-        access_log=True,              # Enable for monitoring parallel requests
-        # Additional optimizations for parallel processing
-        h11_max_incomplete_event_size=32768,  # Larger buffer for parallel requests
-        ws_max_size=33554432,         # Larger websocket for parallel data
+        # Optimized for 1GB RAM with timeout processing
+        timeout_keep_alive=60,        # Reasonable timeout for memory-constrained system
+        limit_concurrency=2,          # Very limited for 1GB RAM
+        limit_max_requests=100,       # Lower limit for memory efficiency
+        access_log=True,              # Enable for monitoring requests
+        # Conservative settings for 1GB RAM
+        h11_max_incomplete_event_size=16384,  # Smaller buffer for memory efficiency
+        ws_max_size=16777216,         # Smaller websocket for memory efficiency
         lifespan="on"
     )

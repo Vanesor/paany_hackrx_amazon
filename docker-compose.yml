@@ -1,67 +1,54 @@
 version: "3.8"
 
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: rag-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - ./redis.conf:/usr/local/etc/redis/redis.conf
-      - redis-data:/data
-    command: redis-server /usr/local/etc/redis/redis.conf
-    restart: unless-stopped
-    networks:
-      - rag-network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-
   rag-system:
     build: .
     container_name: rag-system
     ports:
       - "8000:8000"
     environment:
-      - REDIS_URL=redis://redis:6379
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_DB=0
-      - REDIS_EXPIRE_TIME=86400
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - CACHE_DIR=/app/cache
+      - MODEL_CACHE_DIR=/app/models
       - NLTK_DATA=/app/nltk_data
       - PYTHONPATH=/app
+      - TRANSFORMERS_CACHE=/app/models
+      - SENTENCE_TRANSFORMERS_HOME=/app/models
+      - HF_HOME=/app/models
+      # Accuracy-focused configuration
+      - RAG_MODE=ACCURACY
+      - BGE_MODEL=BAAI/bge-base-en-v1.5
+      - RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
     volumes:
       - ./cache:/app/cache
       - ./downloads:/app/downloads
+      - ./models:/app/models
       - ./auto_downloads:/app/auto_downloads
-    depends_on:
-      redis:
-        condition: service_healthy
     networks:
       - rag-network
     restart: unless-stopped
-    # Resource limits for Lightsail 2GB optimization
+    # Resource limits optimized for 2GB RAM accuracy system
     deploy:
       resources:
         limits:
-          memory: 1.5G
-          cpus: '1.8'
+          memory: 1.8G  # Increased for BGE-base model
+          cpus: '1.9'   # More CPU for accuracy processing
         reservations:
-          memory: 1G
-          cpus: '1.0'
+          memory: 1.2G  # Higher baseline for BGE-base
+          cpus: '1.2'
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
-      timeout: 10s
+      timeout: 15s    # Longer timeout for accuracy models
       retries: 3
-      start_period: 60s
+      start_period: 120s  # More time for BGE-base loading
 
 volumes:
-  redis-data:
+  # Remove redis-data volume as Redis is no longer used
+  model-cache:
+    driver: local
+  app-cache:
+    driver: local
 
 networks:
   rag-network:
