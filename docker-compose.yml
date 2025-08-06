@@ -44,21 +44,3 @@ networks:
 volumes:
   model-cache:
     driver: local
-          memory: 1.5G
-          cpus: '1.8'
-        reservations:
-          memory: 1G
-          cpus: '1.0'
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-
-volumes:
-  redis-data:
-
-networks:
-  rag-network:
-    driver: bridge
